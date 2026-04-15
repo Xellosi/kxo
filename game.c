@@ -2,6 +2,9 @@
 
 #include "game.h"
 
+static const int winpat_len = WIN_PATT_LEN(BOARD_SIZE, GOAL);
+static u32 win_patterns[WIN_PATT_LEN(BOARD_SIZE, GOAL)];
+u8 xo_segment_lines[WIN_PATT_LEN(BOARD_SIZE, GOAL)][GOAL];
 
 const line_t lines[4] = {
     {0, 1, 0, 0, BOARD_SIZE, BOARD_SIZE - GOAL + 1},             // ROW
@@ -10,59 +13,69 @@ const line_t lines[4] = {
     {1, -1, 0, GOAL - 1, BOARD_SIZE - GOAL + 1, BOARD_SIZE},     // SECONDARY
 };
 
-static char check_line_segment_win(const char *t, int i, int j, line_t line)
+static bool detect_empty_cell(uint32_t board)
 {
-    char last = t[GET_INDEX(i, j)];
-    if (last == ' ')
-        return ' ';
-    for (int k = 1; k < GOAL; k++) {
-        if (last != t[GET_INDEX(i + k * line.i_shift, j + k * line.j_shift)])
-            return ' ';
-    }
-
-#if !ALLOW_EXCEED
-    if (last == LOOKUP(t, i - line.i_shift, j - line.j_shift, ' ') ||
-        last ==
-            LOOKUP(t, i + GOAL * line.i_shift, j + GOAL * line.j_shift, ' '))
-        return ' ';
-#endif
-    return last;
+    uint32_t lo = board & 0x55555555;
+    uint32_t hi = board & 0xAAAAAAAA;
+    return (lo | (hi >> 1)) != 0x55555555;
 }
 
-char check_win(const char *t)
+char check_win(unsigned int table)
 {
-    for (int i_line = 0; i_line < 4; ++i_line) {
+    if (!table)
+        return CELL_EMPTY;
+
+    for (int i = 0; i < winpat_len; i++) {
+        unsigned int patt = win_patterns[i];
+        /* check O win */
+        if ((table & patt) == patt)
+            return CELL_O;
+
+        /* check X win */
+        patt <<= 1;
+        if ((table & patt) == patt)
+            return CELL_X;
+    }
+
+    return detect_empty_cell(table) ? CELL_EMPTY : CELL_D;
+}
+
+void fill_win_patterns(void)
+{
+    for (int i_line = 0, w = 0; i_line < 4; ++i_line) {
         line_t line = lines[i_line];
         for (int i = line.i_lower_bound; i < line.i_upper_bound; ++i) {
             for (int j = line.j_lower_bound; j < line.j_upper_bound; ++j) {
-                char win = check_line_segment_win(t, i, j, line);
-                if (win != ' ')
-                    return win;
+                xo_segment_lines[w][0] = GET_INDEX(i, j);
+                for (int k = 1; k < GOAL; k++) {
+                    int id =
+                        GET_INDEX(i + k * line.i_shift, j + k * line.j_shift);
+                    xo_segment_lines[w][k] = id;
+                }
+                win_patterns[w] = GEN_O_WINMASK(xo_segment_lines[w][0],
+                                                xo_segment_lines[w][1],
+                                                xo_segment_lines[w][2]);
+                w++;
             }
         }
     }
-    for (int i = 0; i < N_GRIDS; i++)
-        if (t[i] == ' ')
-            return ' ';
-    return 'D';
 }
 
-fixed_point_t calculate_win_value(char win, char player)
+fixed_point_t calculate_win_value(char win, unsigned char player)
 {
     if (win == player)
         return 1U << FIXED_SCALE_BITS;
-    if (win == (player ^ 'O' ^ 'X'))
+    if (win == (player ^ CELL_O ^ CELL_X))
         return 0U;
     return 1U << (FIXED_SCALE_BITS - 1);
 }
 
-int *available_moves(const char *table)
+int *available_moves(uint32_t table)
 {
     int *moves = kzalloc(N_GRIDS * sizeof(int), GFP_KERNEL);
     int m = 0;
-    for (int i = 0; i < N_GRIDS; i++)
-        if (table[i] == ' ')
-            moves[m++] = i;
+    for_each_empty_grid(i, table) moves[m++] = i;
+
     if (m < N_GRIDS)
         moves[m] = -1;
     return moves;

@@ -1,0 +1,692 @@
+#include <assert.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "game.h"
+#include "tui.h"
+
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define DIVBY(n, b) (!((n) & ((b) - 1)))
+#define ESC "\033"
+#define CLEAR_SCREEN ESC "[2J" ESC "[1;1H"
+#define CLEAR_LINE ESC "[2K"
+#define ALT_BUF_ENABLE "\033[?1049h"
+#define ALT_BUF_DISABLE "\033[?1049l"
+#define HIDE_CURSOR ESC "[?25l"
+#define SHOW_CURSOR ESC "[?25h"
+#define SAVE_XY ESC "[s"
+#define RESTORE_XY ESC "[u"
+#define OUTBUF_SIZE 4096
+#define FLUSH_THRESHOLD 2048 /* Flush when half-full for optimal latency */
+#define COLOR_RESET "\033[0m"
+#define COLOR_RED "\033[31m"
+#define COLOR_GREEN "\033[32m"
+#define o_ch COLOR_GREEN "O" COLOR_RESET
+#define x_ch COLOR_RED "X" COLOR_RESET
+
+#define MIN_COLS 55
+#define MIN_ROWS 21
+
+#define UI_COLS 3
+#define BOXCH_LEN 3
+
+#define TAB_CTX_BASEY 52
+#define TAB_LABEL_BASEY 49
+#define BOARD_W 35
+#define BOARD_H 13
+#define BOARD_BASEY 10
+
+static void xo_record(const enum tui_tab tab, const struct xo_table *tlb);
+static void xo_loadavg(const enum tui_tab tab,
+                       const struct xo_table UNUSED *tlb);
+
+static struct {
+    char buf[OUTBUF_SIZE];
+    size_t len;
+    bool disabled; /* Emergency fallback when buffer management fails */
+} outbuf = {0};
+
+static int tab_maxh = -1;
+static int device_fd;
+
+struct xo_tab {
+    char *title;
+    int high;
+    void (*render)(const enum tui_tab tab, const struct xo_table *tlb);
+};
+
+enum tui_tab prev_tab = TAB_TOTLEN;
+
+static struct xo_tab tui_tabs[TAB_TOTLEN] = {
+    [XO_TAB_RECORD] = {.title = "Records", .high = 11, .render = xo_record},
+    [XO_TAB_LOADAVG] = {.title = "Load avg", .high = 10, .render = xo_loadavg},
+};
+
+static struct termios orig_termios;
+static struct xo_avg xo_avgs[N_GAMES];
+
+static void raw_mode_enable(void)
+{
+    tcgetattr(STDIN_FILENO, &orig_termios);
+
+    struct termios raw = orig_termios;
+    raw.c_iflag &= ~IXON;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+static void raw_mode_disable(void)
+{
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+}
+
+static void safe_write(int fd, const void *buf, size_t count)
+{
+    ssize_t result = write(fd, buf, count);
+    (void) result;
+}
+
+/* Write-combining buffer management with automatic flushing */
+static void outbuf_write(const char *data, size_t data_len)
+{
+    /* Emergency fallback: direct write if buffering disabled */
+    if (outbuf.disabled) {
+        safe_write(STDOUT_FILENO, data, data_len);
+        return;
+    }
+
+    /* Handle writes larger than buffer */
+    if (data_len >= OUTBUF_SIZE) {
+        if (outbuf.len > 0) {
+            safe_write(STDOUT_FILENO, outbuf.buf, outbuf.len);
+            outbuf.len = 0;
+        }
+        safe_write(STDOUT_FILENO, data, data_len);
+        return;
+    }
+
+    /* Check if this write would exceed buffer capacity */
+    if (outbuf.len + data_len > OUTBUF_SIZE) {
+        safe_write(STDOUT_FILENO, outbuf.buf, outbuf.len);
+        outbuf.len = 0;
+    }
+
+    /* Add data to buffer */
+    memcpy(outbuf.buf + outbuf.len, data, data_len);
+    outbuf.len += data_len;
+
+    /* Auto-flush when reaching threshold for optimal latency */
+    if (outbuf.len >= FLUSH_THRESHOLD) {
+        safe_write(STDOUT_FILENO, outbuf.buf, outbuf.len);
+        outbuf.len = 0;
+    }
+}
+
+/* Formatted write to output buffer with bounds checking */
+static void outbuf_printf(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    size_t remaining = OUTBUF_SIZE - outbuf.len;
+
+    int written = vsnprintf(outbuf.buf + outbuf.len, remaining, format, args);
+    va_end(args);
+
+    if (written < 0) {
+        assert(0);
+        outbuf.disabled = true;
+        return;
+    }
+
+    if ((size_t) written >= remaining) {
+        if (outbuf.len > 0) {
+            safe_write(STDOUT_FILENO, outbuf.buf, outbuf.len);
+            outbuf.len = 0;
+        }
+
+        va_start(args, format);
+        written = vsnprintf(outbuf.buf, OUTBUF_SIZE, format, args);
+        va_end(args);
+
+        if (written < 0 || (size_t) written >= OUTBUF_SIZE) {
+            outbuf.disabled = true;
+            return;
+        }
+    }
+
+    outbuf.len += written;
+
+    if (outbuf.len >= FLUSH_THRESHOLD) {
+        safe_write(STDOUT_FILENO, outbuf.buf, outbuf.len);
+        outbuf.len = 0;
+    }
+}
+
+/* Force flush of output buffer */
+void outbuf_flush(void)
+{
+    if (outbuf.len > 0) {
+        safe_write(STDOUT_FILENO, outbuf.buf, outbuf.len);
+        outbuf.len = 0;
+    }
+    fflush(stdout);
+}
+
+void save_xy()
+{
+    outbuf_write(SAVE_XY, strlen(SAVE_XY));
+}
+
+void restore_xy()
+{
+    outbuf_write(RESTORE_XY, strlen(RESTORE_XY));
+}
+
+static void gotoxy(int x, int y)
+{
+    outbuf_printf("\033[%d;%dH", y, x);
+}
+
+static void disable_raw()
+{
+    safe_write(STDOUT_FILENO, ALT_BUF_DISABLE, sizeof(ALT_BUF_DISABLE) - 1);
+    outbuf_flush();
+    raw_mode_disable();
+}
+
+void tui_init(const int fd)
+{
+    raw_mode_enable();
+    outbuf_write(ALT_BUF_ENABLE, strlen(ALT_BUF_ENABLE));
+    outbuf_write(CLEAR_SCREEN HIDE_CURSOR, strlen(CLEAR_SCREEN HIDE_CURSOR));
+    outbuf_printf(HIDE_CURSOR);
+    outbuf_flush();
+
+    for (int i = 0; i < TAB_TOTLEN; i++)
+        tab_maxh = max(tab_maxh, tui_tabs[i].high);
+
+    memset(xo_avgs, 0, sizeof(xo_avgs));
+    device_fd = fd;
+    atexit(disable_raw);
+}
+
+void tui_quit(void)
+{
+    safe_write(STDOUT_FILENO, SHOW_CURSOR, sizeof(SHOW_CURSOR) - 1);
+    safe_write(STDOUT_FILENO, COLOR_RESET, sizeof(COLOR_RESET) - 1);
+    disable_raw();
+}
+
+void clean_screen()
+{
+    outbuf_printf("\033[2J\033[H");
+}
+
+static void clean_line()
+{
+    outbuf_printf(CLEAR_LINE);
+}
+
+char *load_logo(const char *file)
+{
+    int fd = open(file, O_RDONLY);
+
+    if (fd < 0) {
+        printf("not found logo\n");
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return NULL;
+    }
+    size_t sz = st.st_size;
+
+    char *buf = malloc(sz + 1);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+    ssize_t nread = read(fd, buf, sz);
+    close(fd);
+    if (nread < 0) {
+        free(buf);
+        return NULL;
+    }
+    buf[nread] = '\0';
+    return buf;
+}
+
+void render_logo(char *logo)
+{
+    if (!logo)
+        return;
+
+    char *beg = logo;
+    const char *pos;
+    int ln = '\n';
+    int k = 0;
+    int x = 38;
+
+    do {
+        pos = strchr(beg, ln);
+        k++;
+        gotoxy(x, k);
+        size_t len = pos ? (size_t) (pos - beg) : strlen(beg);
+        outbuf_write(beg, len);
+        beg += len + 1;
+    } while (pos);
+
+    gotoxy(x, k);
+    outbuf_flush();
+}
+
+void print_now()
+{
+    static time_t timer;
+    const struct tm *tm_info;
+    time(&timer);
+    tm_info = localtime(&timer);
+    gotoxy(50, 48);
+    outbuf_printf("%02d:%02d:%02d\n", tm_info->tm_hour, tm_info->tm_min,
+                  tm_info->tm_sec);
+}
+
+/* n boards */
+void render_boards_temp(const int n)
+{
+    if (n <= 0)
+        return;
+
+    int rows = (n - 1) / UI_COLS;
+    int rem_bods = n % UI_COLS;
+    int base_y = 10;
+    int bod_w = 35;
+    int bod_h = 11;
+
+    for (int i = 0; i < n; i++) {
+        int r = i / UI_COLS;
+        bool last_col = ((i + 1) % UI_COLS) == 0;
+        bool first_col = (i % UI_COLS) == 0;
+        bool last_row = (r) == rows;
+
+        int x = (i % UI_COLS) * bod_w;
+        int y = base_y + ((i / UI_COLS) * (bod_h + 1));
+        gotoxy(x, y + 1);
+
+        /* horizontal line */
+        for (int j = 0; j < bod_w && i < UI_COLS; j++)
+            outbuf_write("\xe2\x94\x80", BOXCH_LEN);
+
+        if (n == 1 && i < UI_COLS)
+            outbuf_write("\b\xe2\x94\x90", 1 + BOXCH_LEN);
+        else if (i + 1 == UI_COLS || i + 1 == n)
+            outbuf_write("\xe2\x94\x90", BOXCH_LEN);
+
+
+        /* bottom horizontal line */
+        for (int j = 0; j < bod_w; j++) {
+            gotoxy(x + j, base_y + y + 3);
+            outbuf_write("\xe2\x94\x80", BOXCH_LEN);
+        }
+
+        /* vertical line */
+        for (int j = 0; j < bod_h + 2; j++) {
+            /* fill vertical */
+            gotoxy(x, y + j + 1);
+            if (first_col) {
+                if (j == bod_h + 1 && i + 1 == n) {
+                    outbuf_write("\xe2\x94\x94", BOXCH_LEN);
+                    gotoxy(x + bod_w, y + j + 1);
+                    outbuf_write("\xe2\x94\x98", BOXCH_LEN);
+                    continue;
+                } else if (i == 0 && j == 0) {
+                    outbuf_write("\xe2\x94\x8c", BOXCH_LEN);
+                    continue;
+                } else if (j == (bod_h + 1) && last_row) {
+                    outbuf_write("\xe2\x94\x94", BOXCH_LEN);
+                    continue;
+                }
+            }
+
+            if (i < UI_COLS && j == 0)
+                outbuf_write("\xe2\x94\xac", BOXCH_LEN);
+            else if (j == bod_h + 1 && i + UI_COLS > n)
+                outbuf_write("\xe2\x94\xb4", BOXCH_LEN);
+            else if (j == 0 && !first_col)
+                outbuf_write("\xe2\x94\xbc", BOXCH_LEN);
+            else if (j == 0 && first_col)
+                outbuf_write("\xe2\x94\x9c", BOXCH_LEN);
+            else
+                outbuf_write("\xe2\x94\x82", BOXCH_LEN);
+
+
+            /* last vertical line */
+            if (last_col || i + 1 == n) {
+                gotoxy(x + bod_w, y + j + 1);
+                if ((j == bod_h + 1 && i + 1 == n - rem_bods) ||
+                    (j == bod_h + 1 && i + 1 == n))
+                    outbuf_write("\xe2\x94\x98", BOXCH_LEN);
+                else if (j == 0 && (i + 1 == UI_COLS || i < UI_COLS))
+                    outbuf_write("\xe2\x94\x90", BOXCH_LEN);
+                else if (j == 0 && last_col)
+                    outbuf_write("\xe2\x94\xa4", BOXCH_LEN);
+                else if (j == 0 && i > UI_COLS && i + UI_COLS > n)
+                    outbuf_write("\xe2\x94\xbc", BOXCH_LEN);
+                else
+                    outbuf_write("\xe2\x94\x82", BOXCH_LEN);
+            }
+        }
+    }
+
+    outbuf_printf("\n");
+    outbuf_flush();
+}
+
+void update_table(const struct xo_table *xo_tlb)
+{
+    const char *ai_name[XO_AI_TOT] = {
+        [XO_AI_MCTS] = "MCTS",
+        [XO_AI_NEGAMAX] = "NEGA",
+        [XO_AI_RL] = "RL",
+    };
+    const char *cell_tlb[] = {" ", o_ch, x_ch};
+    int id = XO_ATTR_ID(xo_tlb->attr);
+    int alg = XO_ATTR_AI_ALG(xo_tlb->attr);
+    const char *o_alg = ai_name[alg % XO_AI_TOT],
+               *x_alg = ai_name[(alg >> 2) % XO_AI_TOT];
+    unsigned int table = xo_tlb->table;
+    int y = BOARD_BASEY + (id / UI_COLS) * (BOARD_H - 1);
+
+    int x = (id % UI_COLS) * BOARD_W + 1;
+    int tlb_x = x + 9;
+    int tlb_y = y + 3;
+    const int tlb_w = 17;
+    const int tlb_h = 9;
+    const int cell_x = tlb_x + 2;
+    const int cell_y = tlb_y + 1;
+    const int stepx = 4;
+    const int stepy = 2;
+
+    gotoxy(x + 15, y + 2);
+    outbuf_printf("Game-%d\n", id);
+
+    for (int i = 0; i < tlb_h; i++) {
+        gotoxy(tlb_x, tlb_y + i);
+        bool last_h = i + 1 == tlb_h;
+
+        for (int j = 0; j < tlb_w; j++) {
+            bool last_w = j + 1 == tlb_w;
+
+            if (i & 1) {
+                /* odd row */
+                if (DIVBY(j, 4))
+                    outbuf_write("\xe2\x94\x82", BOXCH_LEN);
+                else
+                    outbuf_write(" ", 1);
+            } else {
+                /* even row */
+                if (j == 0) {
+                    if (i == 0)
+                        outbuf_write("\xe2\x94\x8c", BOXCH_LEN);
+                    else if (last_h)
+                        outbuf_write("\xe2\x94\x94", BOXCH_LEN);
+                    else
+                        outbuf_write("\xe2\x94\x9c", BOXCH_LEN);
+
+                } else if (i == 0 && last_w) {
+                    outbuf_write("\xe2\x94\x90", BOXCH_LEN);
+                } else if (DIVBY(j, 4)) {
+                    if (i == 0)
+                        outbuf_write("\xe2\x94\xac", BOXCH_LEN);
+                    else if (i != tlb_h - 1 && !last_w)
+                        outbuf_write("\xe2\x94\xbc", BOXCH_LEN);
+                    else if (last_h && !last_w)
+                        outbuf_write("\xe2\x94\xb4", BOXCH_LEN);
+                    else if (last_h && last_w)
+                        outbuf_write("\xe2\x94\x98", BOXCH_LEN);
+                    else
+                        outbuf_write("\xe2\x94\xa4", BOXCH_LEN);
+
+                } else
+                    outbuf_write("\xe2\x94\x80", BOXCH_LEN);
+            }
+        }
+    }
+
+
+    for (int i = 0; i < N_GRIDS; i++) {
+        const int pos_x = cell_x + (i & (BOARD_SIZE - 1)) * stepx;
+        const int pos_y = cell_y + (i / BOARD_SIZE) * stepy;
+        gotoxy(pos_x, pos_y);
+        outbuf_printf("%s", cell_tlb[TABLE_GET_CELL(table, i)]);
+    }
+
+    gotoxy(x + 12, y + 12);
+    outbuf_printf("%4s vs %-4s\n", o_alg, x_alg);
+    outbuf_flush();
+}
+
+static void draw_tab_border(const enum tui_tab tab)
+{
+    int x = 1;
+    const int w = 106;
+    const int high = tui_tabs[tab].high;
+
+    for (int i = 0; i < tab_maxh + 1; i++) {
+        gotoxy(x, TAB_CTX_BASEY + i);
+        clean_line();
+    }
+
+    gotoxy(x, TAB_CTX_BASEY + high);
+    outbuf_write("\xe2\x95\xb0", BOXCH_LEN);
+    gotoxy(x + w - 2, TAB_CTX_BASEY + high);
+    outbuf_write("\xe2\x95\xaf", BOXCH_LEN);
+
+    for (int i = 0; i < high; i++) {
+        gotoxy(x, TAB_CTX_BASEY + i);
+        outbuf_write("\xe2\x94\x82", BOXCH_LEN);
+        gotoxy(x + w - 2, TAB_CTX_BASEY + i);
+        outbuf_write("\xe2\x94\x82", BOXCH_LEN);
+    }
+
+    gotoxy(x + 1, TAB_CTX_BASEY + high);
+    for (int i = 0; i < w - 3; i++)
+        outbuf_write("\xe2\x94\x80", BOXCH_LEN);
+}
+
+static void xo_record(const enum tui_tab tab, const struct xo_table *tlb)
+{
+    if (tab != prev_tab) {
+        draw_tab_border(tab);
+    }
+    prev_tab = tab;
+    unsigned long moves = tlb->moves;
+    int steps = XO_ATTR_STEPS(tlb->attr);
+    int id = XO_ATTR_ID(tlb->attr);
+    char xy[3];
+    int y = 53;
+    gotoxy(4, y);
+    for (int i = 0; i < N_GAMES; i++) {
+        outbuf_printf("GAME-%d: ", i);
+        gotoxy(4, y + i + 1);
+    }
+    int x = 11;
+    gotoxy(x, y + id);
+    outbuf_printf("%77s", " ");
+    gotoxy(x, y + id);
+    for (int i = 0; i < steps; i++) {
+        uint8_t mv = GET_RECORD_CELL(moves, i);
+        xy[0] = 'A' + (mv & 3);
+        xy[1] = '1' + (mv / BOARD_SIZE);
+        xy[2] = '\0';
+        outbuf_printf(" %s %s", xy, i == steps - 1 ? " " : "\xf0\x9f\xa0\xae");
+    }
+}
+
+static void render_loadavg(const enum tui_tab tab)
+{
+    int y = 52;
+    draw_tab_border(tab);
+    ioctl(device_fd, XO_IO_LDAVG, xo_avgs);
+    gotoxy(17, y);
+    outbuf_printf("Load avg 1min             %s                         %s",
+                  o_ch, x_ch);
+    for (int i = 0; i < N_GAMES; i++) {
+        gotoxy(20, y + i + 1);
+        outbuf_printf(
+            "Game-%d               %d.%02d                      %d.%02d", i,
+            (xo_avgs[i].avg_o & 0x780) >> 7, xo_avgs[i].avg_o & 0x7f,
+            (xo_avgs[i].avg_x & 0x780) >> 7, xo_avgs[i].avg_x & 0x7f);
+    }
+}
+
+static void xo_loadavg(const enum tui_tab tab,
+                       const struct xo_table UNUSED *tlb)
+{
+    static bool focus = false;
+    static struct timespec start;
+    struct timespec last;
+    if (tab != prev_tab) {
+        render_loadavg(tab);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+    } else
+        focus = true;
+
+    prev_tab = tab;
+    clock_gettime(CLOCK_MONOTONIC, &last);
+    uint64_t delta = (last.tv_sec - start.tv_sec) +
+                     (last.tv_nsec - start.tv_nsec) / 1000000000;
+
+    if (focus && delta >= 1) {
+        render_loadavg(tab);
+        start = last;
+    }
+    focus = false;
+}
+
+static void draw_tab_label(enum tui_tab tab)
+{
+    int x = 0;
+    int y = TAB_LABEL_BASEY;
+
+    gotoxy(x, y);
+    int n = 106;
+    int labelh = 3;
+    int tablen = x + 1;
+    /* draw tab label */
+    for (int i = 0; i < TAB_TOTLEN; i++) {
+        struct xo_tab *xtab = &tui_tabs[i];
+        size_t len = strlen(xtab->title);
+        len += 4;
+
+        for (int k = 0; k < labelh; k++) {
+            bool first_row = k == 0;
+            gotoxy(x + tablen, y + k);
+            if (k == 1) {
+                outbuf_printf("\xe2\x94\x82 %s \xe2\x94\x82", xtab->title);
+                continue;
+            }
+
+            for (int j = 0; j < (int) len; j++) {
+                bool first_col = j == 0;
+                bool last_col = j == (int) len - 1;
+                if (first_row) {
+                    if (first_col)
+                        outbuf_write("\xe2\x95\xad", BOXCH_LEN);
+                    else if (last_col)
+                        outbuf_write("\xe2\x95\xae", BOXCH_LEN);
+                    else
+                        outbuf_write("\xe2\x94\x80", BOXCH_LEN);
+
+                } else {
+                    if (first_col) {
+                        if (i == 0)
+                            outbuf_write(
+                                i == tab ? "\xe2\x94\x82" : "\xe2\x94\x9c",
+                                BOXCH_LEN);
+                        else
+                            outbuf_write(
+                                i == tab ? "\xe2\x94\x98" : "\xe2\x94\xb4",
+                                BOXCH_LEN);
+
+                    } else if (last_col)
+                        outbuf_write(i == tab ? "\xe2\x94\x94" : "\xe2\x94\xb4",
+                                     BOXCH_LEN);
+                    else {
+                        if (i == tab) {
+                            outbuf_write(" ", 1);
+                        } else
+                            outbuf_write("\xe2\x94\x80", BOXCH_LEN);
+                    }
+                }
+            }
+        }
+        tablen += len;
+    }
+
+    /* draw last line border */
+    gotoxy(x + tablen, y + labelh - 1);
+    n -= tablen;
+    for (int i = 0; i < n; i++)
+        outbuf_write(i == n - 1 ? "\xe2\x95\xae" : "\xe2\x94\x80", BOXCH_LEN);
+}
+
+void tui_update_tab(enum tui_tab tab, const struct xo_table *tlb)
+{
+    assert(tab < TAB_TOTLEN);
+    draw_tab_label(tab);
+    tui_tabs[tab].render(tab, tlb);
+}
+
+void stop_message(bool stop)
+{
+    int width = 13;
+    int high = 3;
+    int x = 1, y = 8;
+    gotoxy(x, y);
+    if (stop) {
+        for (int i = 0; i < high; i++) {
+            gotoxy(x, y + i);
+            if (i == 1) {
+                outbuf_printf("\xe2\x94\x82  %s  \xe2\x94\x82",
+                              COLOR_GREEN "STOPPING" COLOR_RESET);
+                continue;
+            }
+            for (int j = 0; j < width; j++) {
+                bool is_verti_board = i != 0 && i != high - 1;
+                if (i == 0 && j == 0)
+                    outbuf_write("\xe2\x94\x8c", BOXCH_LEN);
+                else if (i == 0 && j == width - 1)
+                    outbuf_write("\xe2\x94\x90", BOXCH_LEN);
+                else if (i == high - 1 && j == 0)
+                    outbuf_write("\xe2\x94\x94", BOXCH_LEN);
+                else if (i == high - 1 && j == width - 1)
+                    outbuf_write("\xe2\x94\x98", BOXCH_LEN);
+                else if (is_verti_board && (j == 0 || j == width - 1))
+                    outbuf_write("\xe2\x94\x82", BOXCH_LEN);
+                else
+                    outbuf_write("\xe2\x94\x80", BOXCH_LEN);
+            }
+        }
+    } else {
+        /* clean stop message */
+        for (int i = 0; i < high; i++) {
+            gotoxy(x, y + i);
+            outbuf_printf("%13s", " ");
+        }
+    }
+}

@@ -9,7 +9,7 @@ struct node {
     int move;
     char player;
     int n_visits;
-    fixed_point_t score;
+    u64 score;
     struct node *parent;
     struct node *children[N_GRIDS];
 };
@@ -19,12 +19,11 @@ static struct mcts_info mcts_obj;
 static struct node *new_node(int move, char player, struct node *parent)
 {
     struct node *node = kzalloc(sizeof(struct node), GFP_KERNEL);
+    if (!node)
+        return NULL;
     node->move = move;
     node->player = player;
-    node->n_visits = 0;
-    node->score = 0;
     node->parent = parent;
-    memset(node->children, 0, sizeof(node->children));
     return node;
 }
 
@@ -44,7 +43,8 @@ static fixed_point_t fixed_sqrt(fixed_point_t x)
     fixed_point_t s = 0U;
     for (int i = (31 - __builtin_clz(x | 1)); i >= 0; i--) {
         fixed_point_t t = (1U << i);
-        if ((((s + t) * (s + t)) >> FIXED_SCALE_BITS) <= x)
+        u64 candidate = (u64) s + t;
+        if (((candidate * candidate) >> FIXED_SCALE_BITS) <= x)
             s += t;
     }
     return s;
@@ -64,17 +64,15 @@ static fixed_point_t fixed_log(fixed_point_t v)
     }
 
     fixed_point_t y =
-        (numerator << FIXED_SCALE_BITS) / (v + (1U << FIXED_SCALE_BITS));
+        ((u64) numerator << FIXED_SCALE_BITS) / (v + (1U << FIXED_SCALE_BITS));
 
     fixed_point_t ans = 0U;
     for (unsigned i = 1; i < 20; i += 2) {
         fixed_point_t z = (1U << FIXED_SCALE_BITS);
         for (int j = 0; j < i; j++) {
-            z *= y;
-            z >>= FIXED_SCALE_BITS;
+            z = ((u64) z * y) >> FIXED_SCALE_BITS;
         }
-        z <<= FIXED_SCALE_BITS;
-        z /= (i << FIXED_SCALE_BITS);
+        z = ((u64) z << FIXED_SCALE_BITS) / (i << FIXED_SCALE_BITS);
 
         ans += z;
     }
@@ -85,20 +83,17 @@ static fixed_point_t fixed_log(fixed_point_t v)
 
 #define EXPLORATION_FACTOR fixed_sqrt(1U << (FIXED_SCALE_BITS + 1))
 
-static inline fixed_point_t uct_score(int n_total,
-                                      int n_visits,
-                                      fixed_point_t score)
+static inline fixed_point_t uct_score(int n_total, int n_visits, u64 score)
 {
     if (n_visits == 0)
         return FIXED_MAX;
 
-    fixed_point_t result =
-        score << FIXED_SCALE_BITS /
-                     (fixed_point_t) (n_visits << FIXED_SCALE_BITS);
+    fixed_point_t result = (fixed_point_t) (score / n_visits);
+    fixed_point_t log_val = fixed_log(
+        (n_total < 65536) ? (n_total << FIXED_SCALE_BITS) : FIXED_MAX);
     fixed_point_t tmp =
-        EXPLORATION_FACTOR *
-        fixed_sqrt(fixed_log(n_total << FIXED_SCALE_BITS) / n_visits);
-    tmp >>= FIXED_SCALE_BITS;
+        ((u64) EXPLORATION_FACTOR * fixed_sqrt(log_val / n_visits)) >>
+        FIXED_SCALE_BITS;
     return result + tmp;
 }
 
@@ -120,11 +115,10 @@ static struct node *select_move(struct node *node)
     return best_node;
 }
 
-static fixed_point_t simulate(const char *table, char player)
+static fixed_point_t simulate(uint32_t table, char player)
 {
     char current_player = player;
-    char temp_table[N_GRIDS];
-    memcpy(temp_table, table, N_GRIDS);
+    uint32_t temp_table = table;
     xoro_jump(&(mcts_obj.xoro_obj));
     while (1) {
         int *moves = available_moves(temp_table);
@@ -137,11 +131,11 @@ static fixed_point_t simulate(const char *table, char player)
             ++n_moves;
         int move = moves[xoro_next(&(mcts_obj.xoro_obj)) % n_moves];
         kfree(moves);
-        temp_table[move] = current_player;
+        temp_table = VAL_SET_CELL(temp_table, move, current_player);
         char win;
-        if ((win = check_win(temp_table)) != ' ')
+        if ((win = check_win(temp_table)) != CELL_EMPTY)
             return calculate_win_value(win, player);
-        current_player ^= 'O' ^ 'X';
+        current_player ^= CELL_O ^ CELL_X;
     }
     return (fixed_point_t) (1UL << (FIXED_SCALE_BITS - 1));
 }
@@ -152,36 +146,42 @@ static void backpropagate(struct node *node, fixed_point_t score)
         node->n_visits++;
         node->score += score;
         node = node->parent;
-        score = 1 - score;
+        score = (1U << FIXED_SCALE_BITS) - score;
     }
 }
 
-static int expand(struct node *node, const char *table)
+static int expand(struct node *node, uint32_t table)
 {
     int *moves = available_moves(table);
     int n_moves = 0;
     while (n_moves < N_GRIDS && moves[n_moves] != -1)
         ++n_moves;
     for (int i = 0; i < n_moves; i++) {
-        node->children[i] = new_node(moves[i], node->player ^ 'O' ^ 'X', node);
+        node->children[i] =
+            new_node(moves[i], node->player ^ CELL_O ^ CELL_X, node);
+        if (!node->children[i]) {
+            kfree(moves);
+            return i;
+        }
     }
     kfree(moves);
     return n_moves;
 }
 
-int mcts(const char *table, char player)
+int mcts(uint32_t table, char player)
 {
     char win;
     struct node *root = new_node(-1, player, NULL);
+    if (!root)
+        return -1;
     mcts_obj.nr_active_nodes = 1;
     for (int i = 0; i < ITERATIONS; i++) {
         struct node *node = root;
-        char temp_table[N_GRIDS];
-        memcpy(temp_table, table, N_GRIDS);
+        uint32_t temp_table = table;
         while (1) {
-            if ((win = check_win(temp_table)) != ' ') {
+            if ((win = check_win(temp_table)) != CELL_EMPTY) {
                 fixed_point_t score =
-                    calculate_win_value(win, node->player ^ 'O' ^ 'X');
+                    calculate_win_value(win, node->player ^ CELL_O ^ CELL_X);
                 backpropagate(node, score);
                 break;
             }
@@ -193,9 +193,12 @@ int mcts(const char *table, char player)
             if (node->children[0] == NULL)
                 mcts_obj.nr_active_nodes += expand(node, temp_table);
             node = select_move(node);
-            if (!node)
+            if (!node) {
+                free_node(root);
                 return -1;
-            temp_table[node->move] = node->player ^ 'O' ^ 'X';
+            }
+            temp_table = VAL_SET_CELL(temp_table, node->move,
+                                      node->player ^ CELL_O ^ CELL_X);
         }
     }
     struct node *best_node = root;

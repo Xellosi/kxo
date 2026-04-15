@@ -7,6 +7,7 @@ u64 zobrist_table[N_GRIDS][2];
 #define HASH(key) ((key) % HASH_TABLE_SIZE)
 
 static struct hlist_head *hash_table;
+static DEFINE_SPINLOCK(zorbist_lock);
 
 /* See https://github.com/wangyi-fudan/wyhash
  */
@@ -37,41 +38,63 @@ void zobrist_init(void)
     hash_table =
         kmalloc(sizeof(struct hlist_head) * HASH_TABLE_SIZE, GFP_KERNEL);
     if (!hash_table) {
-        pr_info("kxo: Failed to allocate space for hash_table\n");
+        pr_err("kxo: Failed to allocate zobrist hash table\n");
         return;
     }
     for (i = 0; i < HASH_TABLE_SIZE; i++)
         INIT_HLIST_HEAD(&hash_table[i]);
 }
 
-zobrist_entry_t *zobrist_get(u64 key)
+/* Copy entry data under lock to avoid use-after-free */
+bool zobrist_get(u64 key, int *score, int *move)
 {
+    if (!hash_table)
+        return false;
+
     unsigned long long hash_key = HASH(key);
 
-    if (hlist_empty(&hash_table[hash_key]))
-        return NULL;
+    spin_lock_bh(&zorbist_lock);
+    if (hlist_empty(&hash_table[hash_key])) {
+        spin_unlock_bh(&zorbist_lock);
+        return false;
+    }
 
     zobrist_entry_t *entry = NULL;
-
     hlist_for_each_entry(entry, &hash_table[hash_key], ht_list) {
-        if (entry->key == key)
-            return entry;
+        if (entry->key == key) {
+            *score = entry->score;
+            *move = entry->move;
+            spin_unlock_bh(&zorbist_lock);
+            return true;
+        }
     }
-    return NULL;
+    spin_unlock_bh(&zorbist_lock);
+    return false;
 }
 
 void zobrist_put(u64 key, int score, int move)
 {
+    if (!hash_table)
+        return;
+
     unsigned long long hash_key = HASH(key);
     zobrist_entry_t *new_entry = kmalloc(sizeof(zobrist_entry_t), GFP_KERNEL);
+    if (!new_entry)
+        return;
     new_entry->key = key;
     new_entry->move = move;
     new_entry->score = score;
+    spin_lock_bh(&zorbist_lock);
     hlist_add_head(&new_entry->ht_list, &hash_table[hash_key]);
+    spin_unlock_bh(&zorbist_lock);
 }
 
 void zobrist_clear(void)
 {
+    if (!hash_table)
+        return;
+
+    spin_lock_bh(&zorbist_lock);
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         while (!hlist_empty(&hash_table[i])) {
             zobrist_entry_t *entry =
@@ -81,4 +104,12 @@ void zobrist_clear(void)
         }
         INIT_HLIST_HEAD(&hash_table[i]);
     }
+    spin_unlock_bh(&zorbist_lock);
+}
+
+void zobrist_destroy(void)
+{
+    zobrist_clear();
+    kfree(hash_table);
+    hash_table = NULL;
 }
