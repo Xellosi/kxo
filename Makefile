@@ -19,7 +19,10 @@ OBJS += xo-user.o
 OBJS += tui.o
 OBJS += coro.o
 
-.PHONY: all kmod check-unit check clean
+VANITY_BASE := 0000e59602509f70319e2e4b915fcf1b9a1e2476
+VANITY_PREFIX := 0000
+
+.PHONY: all kmod check-unit check clean check-hashes
 
 ifneq ($(UNAME_S),Linux)
 define REQUIRE_LINUX
@@ -28,9 +31,9 @@ endef
 endif
 
 ifeq ($(UNAME_S),Linux)
-all: $(GIT_HOOKS) kmod xo-user
+all: $(GIT_HOOKS) check-hashes kmod xo-user
 else
-all: $(GIT_HOOKS)
+all: $(GIT_HOOKS) check-hashes
 	@echo "Non-Linux host detected ($(UNAME_S)). Only git hooks were installed."
 	@echo "Build and test require a Linux environment."
 endif
@@ -78,6 +81,22 @@ check: check-unit all
 $(GIT_HOOKS):
 	@scripts/install-git-hooks
 	@echo
+
+check-hashes:
+	@if git cat-file -e $(VANITY_BASE) 2>/dev/null; then \
+	    bad=$$(git rev-list --no-merges $(VANITY_BASE)..HEAD | \
+	        grep -v '^$(VANITY_PREFIX)'); \
+	    if [ -n "$$bad" ]; then \
+	        echo "Error: the following commits do not start with '$(VANITY_PREFIX)':"; \
+	        for h in $$bad; do \
+	            echo "  $$h $$(git show -s --format=%s $$h)"; \
+	        done; \
+	        echo ""; \
+	        echo "Git hooks were not installed correctly."; \
+	        echo "Run 'scripts/install-git-hooks' and amend the problematic commits."; \
+	        exit 1; \
+	    fi; \
+	fi
 
 clean:
 ifeq ($(UNAME_S),Linux)

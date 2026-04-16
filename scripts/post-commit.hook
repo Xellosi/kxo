@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+# Post-commit hook for kxo.
+#
+# Rewrites HEAD to have a vanity SHA-1 prefix by invoking vanity-hash.py.
+# Skipped in CI and when python3 is unavailable.
+
+set -eu
+
+if [ -n "${CI:-}" ] || [ -d /home/runner/work ]; then
+    exit 0
+fi
+
+# Resolve through any symlink chain (invoked via .git/hooks symlink).
+source=${BASH_SOURCE[0]}
+while [ -L "$source" ]; do
+    dir=$(cd -P "$(dirname "$source")" && pwd)
+    source=$(readlink "$source")
+    [[ $source != /* ]] && source=$dir/$source
+done
+script_dir=$(cd -P "$(dirname "$source")" && pwd)
+vanity=$script_dir/vanity-hash.py
+
+if [ -x "$vanity" ] && command -v python3 > /dev/null 2>&1; then
+    python3 "$vanity"
+fi

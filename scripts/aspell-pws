@@ -186,3 +186,6 @@ Makefile
 REQUIRE
 CURDIR
 clang
+SHA
+hashlib
+py
