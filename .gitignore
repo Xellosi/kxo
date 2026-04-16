@@ -9,3 +9,4 @@
 xo-user
 tests/test-game
 tests/test-coro
+externals/

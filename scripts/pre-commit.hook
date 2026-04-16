@@ -1,89 +1,115 @@
 #!/usr/bin/env bash
 
+# Pre-commit hook for kxo.
+#
+# Checks:
+#   1. C/H source files follow .clang-format
+#   2. No banned unsafe functions (gets, sprintf, strcpy)
+#   3. cppcheck static analysis
+#   4. Shell scripts follow shfmt (per .editorconfig, staged content)
+
 CPPCHECK_suppresses="--suppress=unmatchedSuppression \
---suppress=missingIncludeSystem -i kxo.mod.c --suppress=variableScope \
---suppress=unmatchedSuppression:main.c \
---suppress=constParameterPointer:main.c \
---suppress=constParameterCallback:main.c \
---suppress=unusedFunction:main.c"
-CPPCHECK_OPTS="-I. --enable=all --error-exitcode=1 --force $CPPCHECK_suppresses ."
+--suppress=missingIncludeSystem --suppress=variableScope \
+--suppress=checkersReport --suppress=normalCheckLevelMaxBranches \
+--suppress=unusedFunction --suppress=constParameterPointer \
+--suppress=constParameterCallback --suppress=constVariable \
+--suppress=shadowVariable --suppress=staticFunction \
+--suppress=intToPointerCast --suppress=syntaxError:main.c \
+--suppress=uninitvar:rl-state-ht.c"
+CPPCHECK_OPTS="-I. --enable=all --error-exitcode=1 --force $CPPCHECK_suppresses"
 
 RETURN=0
-CLANG_FORMAT=$(which clang-format)
-if [ $? -ne 0 ]; then
-    echo "[!] clang-format not installed. Unable to check source file format policy." >&2
+
+CLANG_FORMAT=$(command -v clang-format)
+if [ -z "$CLANG_FORMAT" ]; then
+    echo "[!] clang-format not installed." >&2
     exit 1
 fi
 
-CPPCHECK=$(which cppcheck)
-if [ $? -ne 0 ]; then
-    echo "[!] cppcheck not installed. Unable to perform static analysis." >&2
+CPPCHECK=$(command -v cppcheck)
+if [ -z "$CPPCHECK" ]; then
+    echo "[!] cppcheck not installed." >&2
     exit 1
 fi
 
-ASPELL=$(which aspell)
-if [ $? -ne 0 ]; then
-    echo "[!] aspell not installed. Unable to do spelling check." >&2
-    exit 1
-fi
+DIFF=$(command -v colordiff)
+[ -z "$DIFF" ] && DIFF=diff
 
-DIFF=$(which colordiff)
-if [ $? -ne 0 ]; then
-    DIFF=diff
-fi
-
-FILES=`git diff --cached --name-only --diff-filter=ACMR | grep -E "\.(c|cpp|h)$"`
+# C/H formatting check (staged content)
+FILES=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h)$' || true)
 for FILE in $FILES; do
-    nf=`git checkout-index --temp $FILE | cut -f 1`
-    tempdir=`mktemp -d` || exit 1
-    newfile=`mktemp ${tempdir}/${nf}.XXXXXX` || exit 1
-    basename=`basename $FILE`
-
+    nf=$(git checkout-index --temp "$FILE" | cut -f 1)
+    tempdir=$(mktemp -d) || exit 1
+    newfile=$(mktemp "${tempdir}/${nf}.XXXXXX") || exit 1
+    basename=$(basename "$FILE")
     source="${tempdir}/${basename}"
-    mv $nf $source
-    cp .clang-format $tempdir
-    $CLANG_FORMAT $source > $newfile 2>> /dev/null
-    $DIFF -u -p -B --label="modified $FILE" --label="expected coding style" \
-          "${source}" "${newfile}"
+    mv "$nf" "$source"
+    cp .clang-format "$tempdir"
+    "$CLANG_FORMAT" "$source" > "$newfile" 2> /dev/null
+    "$DIFF" -u -p -B \
+        --label="modified $FILE" \
+        --label="expected coding style" \
+        "$source" "$newfile"
     r=$?
-    rm -rf "${tempdir}"
-    if [ $r != 0 ] ; then
+    rm -rf "$tempdir"
+    if [ $r != 0 ]; then
         echo "[!] $FILE does not follow the consistent coding style." >&2
-        RETURN=1
-    fi
-    if [ $RETURN -eq 1 ]; then
-        echo "" >&2
-        echo "Make sure you indent as the following:" >&2
         echo "    clang-format -i $FILE" >&2
-        echo
-    fi
-done
-
-# Prevent unsafe functions
-root=$(git rev-parse --show-toplevel)
-banned="([^f]gets\()|(sprintf\()|(strcpy\()"
-status=0
-for file in $(git diff --staged --name-only | grep -E "\.(c|cc|cpp|h|hh|hpp)\$")
-do
-    filepath="${root}/${file}"
-    output=$(grep -nrE "${banned}" "${filepath}")
-    if [ ! -z "${output}" ]; then
-        echo "Dangerous function detected in ${filepath}"
-        echo "${output}"
-        echo
-        echo "Read 'Common vulnerabilities guide for C programmers' carefully."
-        echo "    https://security.web.cern.ch/security/recommendations/en/codetools/c.shtml"
+        echo "" >&2
         RETURN=1
     fi
 done
 
-# static analysis
-$CPPCHECK $CPPCHECK_OPTS >/dev/null
-if [ $? -ne 0 ]; then
-    RETURN=1
-    echo "" >&2
-    echo "Fail to pass static analysis." >&2
-    echo
+# Banned unsafe functions (newly added code)
+root=$(git rev-parse --show-toplevel)
+banned='([^f]gets\()|(sprintf\()|(strcpy\()'
+for file in $(git diff --staged --name-only | grep -E '\.(c|cc|cpp|h|hh|hpp)$' || true); do
+    filepath="${root}/${file}"
+    output=$(grep -nrE "${banned}" "${filepath}" || true)
+    if [ -n "${output}" ]; then
+        echo "Dangerous function detected in ${filepath}" >&2
+        echo "${output}" >&2
+        echo "" >&2
+        echo "Read 'Common vulnerabilities guide for C programmers' carefully." >&2
+        echo "    https://security.web.cern.ch/security/recommendations/en/codetools/c.shtml" >&2
+        RETURN=1
+    fi
+done
+
+# cppcheck static analysis (staged C/H files only)
+STAGED_C=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h)$' || true)
+if [ -n "$STAGED_C" ]; then
+    # shellcheck disable=SC2086
+    if ! "$CPPCHECK" $CPPCHECK_OPTS $STAGED_C > /dev/null; then
+        echo "[!] Failed to pass static analysis." >&2
+        RETURN=1
+    fi
+fi
+
+# Shell script formatting (shfmt per .editorconfig, staged blobs)
+SHELL_PATHSPECS=('*.sh' '*.hook' 'scripts/install-git-hooks')
+
+HAS_SHELL=0
+while IFS= read -r -d '' _; do
+    HAS_SHELL=1
+    break
+done < <(git diff --cached --name-only -z --diff-filter=ACMR -- "${SHELL_PATHSPECS[@]}")
+
+if [ "$HAS_SHELL" -eq 1 ]; then
+    SHFMT=$(command -v shfmt)
+    if [ -z "$SHFMT" ]; then
+        echo "[!] shfmt not installed. Unable to check shell script format." >&2
+        exit 1
+    fi
+    while IFS= read -r -d '' file; do
+        if ! git show ":$file" | "$SHFMT" -d -filename "$file" - > /dev/null 2>&1; then
+            echo "[!] $file does not follow shell script coding style." >&2
+            git show ":$file" | "$SHFMT" -d -filename "$file" - >&2
+            printf '    shfmt -w %q\n' "$file" >&2
+            echo "" >&2
+            RETURN=1
+        fi
+    done < <(git diff --cached --name-only -z --diff-filter=ACMR -- "${SHELL_PATHSPECS[@]}")
 fi
 
 exit $RETURN

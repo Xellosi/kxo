@@ -178,3 +178,11 @@ PTR
 ttt
 tictactoe
 vmalloc
+shfmt
+editorconfig
+Negamax
+PHONY
+Makefile
+REQUIRE
+CURDIR
+clang

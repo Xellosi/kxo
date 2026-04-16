@@ -16,25 +16,28 @@ GREEN='\033[32m'
 RED='\033[31m'
 RESET='\033[0m'
 
-pass() {
+pass()
+{
     PASS_COUNT=$((PASS_COUNT + 1))
     TOTAL=$((TOTAL + 1))
     printf "Test %-40s[ ${GREEN}OK${RESET} ]\n" "$1"
 }
 
-fail() {
+fail()
+{
     FAIL_COUNT=$((FAIL_COUNT + 1))
     TOTAL=$((TOTAL + 1))
     printf "Test %-40s[ ${RED}FAIL${RESET} ] %s\n" "$1" "$2"
 }
 
-cleanup() {
-    if [ -n "$READER_PID" ] && kill -0 "$READER_PID" 2>/dev/null; then
-        kill "$READER_PID" 2>/dev/null
-        wait "$READER_PID" 2>/dev/null
+cleanup()
+{
+    if [ -n "$READER_PID" ] && kill -0 "$READER_PID" 2> /dev/null; then
+        kill "$READER_PID" 2> /dev/null
+        wait "$READER_PID" 2> /dev/null
     fi
     if lsmod | grep -q '^kxo '; then
-        rmmod kxo 2>/dev/null
+        rmmod kxo 2> /dev/null
     fi
 }
 trap cleanup EXIT
@@ -52,7 +55,7 @@ if [ ! -f "$KMOD" ]; then
 fi
 
 if lsmod | grep -q '^kxo '; then
-    rmmod kxo 2>/dev/null
+    rmmod kxo 2> /dev/null
 fi
 
 dmesg -C
@@ -84,10 +87,10 @@ cat "$DEV" > /dev/null 2>&1 &
 READER_PID=$!
 sleep "$DURATION"
 
-if kill -0 "$READER_PID" 2>/dev/null; then
+if kill -0 "$READER_PID" 2> /dev/null; then
     pass "device_read_${DURATION}s"
-    kill "$READER_PID" 2>/dev/null
-    wait "$READER_PID" 2>/dev/null || true
+    kill "$READER_PID" 2> /dev/null
+    wait "$READER_PID" 2> /dev/null || true
     READER_PID=
 else
     fail "device_read_${DURATION}s" "reader died"
@@ -111,7 +114,7 @@ else
 fi
 
 # Clean unload
-if rmmod kxo 2>/dev/null; then
+if rmmod kxo 2> /dev/null; then
     pass "rmmod"
 else
     fail "rmmod" "unload failed"

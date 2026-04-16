@@ -13,7 +13,7 @@ echo -e "      https://help.github.com/en/github/using-git/why-is-git-always-ask
 echo ""
 
 # only run this if you are pushing to master
-if [[ $current_branch = $protected_branch ]] ; then
+if [[ $current_branch = $protected_branch ]]; then
     echo -e "${YELLOW}Running pre push to master check...${NC}"
 
     echo -e "${YELLOW}Trying to build tests project...${NC}"
@@ -23,7 +23,7 @@ if [[ $current_branch = $protected_branch ]] ; then
 
     # $? is a shell variable which stores the return code from what we just ran
     rc=$?
-    if [[ $rc != 0 ]] ; then
+    if [[ $rc != 0 ]]; then
         echo -e "${RED}Failed to build the project, please fix this and push again${NC}"
         echo ""
         exit $rc
