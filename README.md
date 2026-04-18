@@ -33,6 +33,21 @@ Win detection uses precomputed bitmask patterns, and move generation operates
 entirely through bitwise operations. This compact representation reduces
 kernel-to-userspace transfer to a single integer per board state.
 
+## Source Layout
+
+```
+include/        Public headers shared by kernel module, userspace, and tests
+src/            Kernel module implementation and module-private headers
+user/           Userspace programs (xo-user TUI, coroutine runtime)
+tests/          Unit tests (test-game, test-coro) and integration driver
+scripts/        Git hooks, static-analysis entry point, vanity hash tooling
+```
+
+Common interfaces are exposed via `include/` so both the kernel module
+(`src/`) and userspace programs (`user/`) share type definitions and
+function declarations. Tests under `tests/` link against implementations
+without reaching into module internals.
+
 ## Build and Run
 
 ```shell
@@ -44,12 +59,22 @@ sudo rmmod kxo
 
 Requires kernel headers at `/lib/modules/$(uname -r)/build`.
 
+### Static Analysis
+
+```shell
+make cppcheck     # run cppcheck over src/ and include/
+```
+
+`scripts/cppcheck.sh` is the single source of truth for cppcheck options
+and suppressions; the pre-commit hook invokes it on staged files only.
+
 ### Userspace TUI
 
-`xo-user` renders all 9 game boards in a 3x3 grid using Unicode box-drawing
-characters and ANSI terminal control. It uses a lightweight coroutine runtime
-(adapted from [cserv](https://github.com/sysprog21/cserv)) for cooperative
-multitasking between I/O, display, and tab rendering.
+`xo-user` (source in `user/xo-user.c`, `user/tui.c`, `user/coro.c`) renders all
+9 game boards in a 3x3 grid using Unicode box-drawing characters and ANSI
+terminal control. It uses a lightweight coroutine runtime (adapted from
+[cserv](https://github.com/sysprog21/cserv)) for cooperative multitasking
+between I/O, display, and tab rendering.
 
 Controls:
 - `Ctrl+P`: Toggle pause/resume of board display

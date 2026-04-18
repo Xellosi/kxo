@@ -1,4 +1,4 @@
-/* Minimal coroutine runtime adapted from cserv (src/coro/).
+/* Minimal coroutine runtime.
  * Context switch via inline assembly for x86-64 and aarch64.
  * Adds a simple buffered channel for inter-coroutine communication.
  */

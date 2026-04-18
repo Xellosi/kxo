@@ -5,30 +5,14 @@
 # Checks:
 #   1. C/H source files follow .clang-format
 #   2. No banned unsafe functions (gets, sprintf, strcpy)
-#   3. cppcheck static analysis
+#   3. cppcheck static analysis (delegated to scripts/cppcheck.sh)
 #   4. Shell scripts follow shfmt (per .editorconfig, staged content)
-
-CPPCHECK_suppresses="--suppress=unmatchedSuppression \
---suppress=missingIncludeSystem --suppress=variableScope \
---suppress=checkersReport --suppress=normalCheckLevelMaxBranches \
---suppress=unusedFunction --suppress=constParameterPointer \
---suppress=constParameterCallback --suppress=constVariable \
---suppress=shadowVariable --suppress=staticFunction \
---suppress=intToPointerCast --suppress=syntaxError:main.c \
---suppress=uninitvar:rl-state-ht.c"
-CPPCHECK_OPTS="-I. --enable=all --error-exitcode=1 --force $CPPCHECK_suppresses"
 
 RETURN=0
 
 CLANG_FORMAT=$(command -v clang-format)
 if [ -z "$CLANG_FORMAT" ]; then
     echo "[!] clang-format not installed." >&2
-    exit 1
-fi
-
-CPPCHECK=$(command -v cppcheck)
-if [ -z "$CPPCHECK" ]; then
-    echo "[!] cppcheck not installed." >&2
     exit 1
 fi
 
@@ -40,7 +24,7 @@ FILES=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h)$
 for FILE in $FILES; do
     nf=$(git checkout-index --temp "$FILE" | cut -f 1)
     tempdir=$(mktemp -d) || exit 1
-    newfile=$(mktemp "${tempdir}/${nf}.XXXXXX") || exit 1
+    newfile=$(mktemp "${tempdir}/$(basename "$nf").XXXXXX") || exit 1
     basename=$(basename "$FILE")
     source="${tempdir}/${basename}"
     mv "$nf" "$source"
@@ -80,8 +64,9 @@ done
 STAGED_C=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h)$' || true)
 if [ -n "$STAGED_C" ]; then
     # shellcheck disable=SC2086
-    if ! "$CPPCHECK" $CPPCHECK_OPTS $STAGED_C > /dev/null; then
+    if ! scripts/cppcheck.sh $STAGED_C > /dev/null; then
         echo "[!] Failed to pass static analysis." >&2
+        echo "    scripts/cppcheck.sh $STAGED_C" >&2
         RETURN=1
     fi
 fi

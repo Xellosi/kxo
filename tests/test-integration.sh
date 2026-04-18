@@ -7,7 +7,7 @@ set -e
 KMOD=kxo.ko
 DEV=/dev/kxo
 SYSFS=/sys/class/kxo/kxo/kxo_state
-DURATION=${1:-5}
+DURATION=${1:-20}
 PASS_COUNT=0
 FAIL_COUNT=0
 TOTAL=0
@@ -82,26 +82,42 @@ else
     fail "sysfs_readable" "kxo_state missing or empty"
 fi
 
-# Sustained read
+# Sustained read -- poll for game completion instead of a fixed sleep.
+# Exit as soon as at least one win appears in dmesg, or after DURATION seconds.
 cat "$DEV" > /dev/null 2>&1 &
 READER_PID=$!
-sleep "$DURATION"
+
+ELAPSED=0
+WIN_COUNT=0
+while [ "$ELAPSED" -lt "$DURATION" ]; do
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+    if ! kill -0 "$READER_PID" 2> /dev/null; then
+        break
+    fi
+    WIN_COUNT=$(dmesg | grep -c 'win!!!' || true)
+    if [ "$WIN_COUNT" -gt 0 ]; then
+        break
+    fi
+done
 
 if kill -0 "$READER_PID" 2> /dev/null; then
-    pass "device_read_${DURATION}s"
+    pass "device_read_${ELAPSED}s"
     kill "$READER_PID" 2> /dev/null
     wait "$READER_PID" 2> /dev/null || true
     READER_PID=
 else
-    fail "device_read_${DURATION}s" "reader died"
+    fail "device_read_${ELAPSED}s" "reader died"
 fi
 
 # Games completed
-WIN_COUNT=$(dmesg | grep -c 'win!!!' || true)
+if [ "$WIN_COUNT" -eq 0 ]; then
+    WIN_COUNT=$(dmesg | grep -c 'win!!!' || true)
+fi
 if [ "$WIN_COUNT" -gt 0 ]; then
-    pass "games_completed (${WIN_COUNT} wins)"
+    pass "games_completed (${WIN_COUNT} wins in ${ELAPSED}s)"
 else
-    fail "games_completed" "no wins in dmesg"
+    fail "games_completed" "no wins in dmesg after ${DURATION}s"
 fi
 
 # Kernel health

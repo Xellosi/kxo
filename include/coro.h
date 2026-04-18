@@ -3,9 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Adapted from cserv (src/coro/) for kxo userspace visualization.
- * Context switch via inline assembly for x86-64 and aarch64.
- */
+/* Context switch via inline assembly for x86-64 and aarch64. */
 
 #if defined(__i386__)
 #define REGPARM(n) __attribute__((regparm((n))))

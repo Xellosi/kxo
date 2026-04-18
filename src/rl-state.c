@@ -27,6 +27,10 @@ static void clean_state(void)
 {
     struct xo_state *st, *safe;
     u32 pos, i = 0;
+    /* cppcheck-suppress-begin uninitvar
+     * list_for_each_entry_safe() initializes st/safe before the loop body
+     * runs, but cppcheck cannot trace through the kernel list macro.
+     */
     list_for_each_entry_safe(st, safe, &orders, list) {
         if (i >= CLEAN_N_STATES)
             break;
@@ -38,6 +42,7 @@ static void clean_state(void)
         bitmap_clear(st_map, pos, 1);
         i++;
     }
+    /* cppcheck-suppress-end uninitvar */
 }
 
 rl_fxp *find_rl_state(const u32 table)

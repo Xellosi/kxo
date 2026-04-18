@@ -4,14 +4,14 @@
  */
 
 #define TEST_MAIN
-#include "../game.h"
+#include "../include/game.h"
 #include "common.h"
 
 /* Pull in the implementation directly so we can test static functions */
-#include "../game.c"
+#include "../src/game.c"
 
 /* Pull in scoring after xo_segment_lines is defined */
-#include "../util.h"
+#include "../include/util.h"
 
 /* ---- Bit manipulation ---- */
 

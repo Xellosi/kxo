@@ -1,7 +1,7 @@
 /* Tests for the coroutine runtime: context switch, scheduling, channels */
 
 #define TEST_MAIN
-#include "../coro.h"
+#include "../include/coro.h"
 #include "common.h"
 
 /* ---- Basic coroutine ---- */

@@ -1,28 +1,32 @@
+TARGET := kxo
+
+# kbuild pass (entered via `$(MAKE) -C $(KDIR) M=$(CURDIR) modules`)
+ifneq ($(KERNELRELEASE),)
+
+obj-m := $(TARGET).o
+$(TARGET)-objs := src/main.o src/game.o src/xoroshiro.o src/mcts.o src/negamax.o
+$(TARGET)-objs += src/zobrist.o src/rl.o src/rl-state.o
+
+ccflags-y := -std=gnu99 -Wno-declaration-after-statement -I$(src)/include
+
+# Top-level pass (invoked by the user directly)
+else
+
 UNAME_S := $(shell uname -s)
 
-TARGET = kxo
-kxo-objs = main.o game.o xoroshiro.o mcts.o negamax.o zobrist.o
-kxo-objs += rl.o rl-state-ht.o
-obj-m := $(TARGET).o
-
-ccflags-y := -std=gnu99 -Wno-declaration-after-statement
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 GIT_HOOKS := .git/hooks/applied
 
-LDFLAGS :=
-CFLAGS :=
-CFLAGS += -g
+XO_CPPFLAGS := -Iinclude
+XO_CFLAGS   := -g
 
-OBJS :=
-OBJS += xo-user.o
-OBJS += tui.o
-OBJS += coro.o
+USER_OBJS := user/xo-user.o user/tui.o user/coro.o
 
 VANITY_BASE := 0000e59602509f70319e2e4b915fcf1b9a1e2476
 VANITY_PREFIX := 0000
 
-.PHONY: all kmod check-unit check clean check-hashes
+.PHONY: all kmod check-unit check cppcheck clean check-hashes
 
 ifneq ($(UNAME_S),Linux)
 define REQUIRE_LINUX
@@ -38,35 +42,30 @@ all: $(GIT_HOOKS) check-hashes
 	@echo "Build and test require a Linux environment."
 endif
 
-kmod: main.c
+kmod: src/main.c
 	$(REQUIRE_LINUX)
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
-xo-user: $(OBJS)
+xo-user: $(USER_OBJS)
 	$(REQUIRE_LINUX)
 	$(CC) $(LDFLAGS) -o $@ $^
 
-xo-user.o: xo-user.c
+user/%.o: user/%.c
 	$(REQUIRE_LINUX)
-	$(CC) $< $(CFLAGS) -c -o $@
+	$(CC) $(CPPFLAGS) $(XO_CPPFLAGS) $(CFLAGS) $(XO_CFLAGS) -c -o $@ $<
 
-tui.o: tui.c
-	$(REQUIRE_LINUX)
-	$(CC) $< $(CFLAGS) -c -o $@
-
-coro.o: coro.c
-	$(REQUIRE_LINUX)
-	$(CC) $< $(CFLAGS) -c -o $@
+# Conservative header dependencies for userspace objects
+$(USER_OBJS): include/coro.h include/game.h include/tui.h
 
 UNIT_TESTS := tests/test-game tests/test-coro
 
-tests/test-game: tests/test-game.c tests/common.h game.h game.c util.h
+tests/test-game: tests/test-game.c tests/common.h include/game.h src/game.c include/util.h
 	$(REQUIRE_LINUX)
-	$(CC) -std=gnu99 -Wall -Wextra -g -Itests -I. -o $@ $<
+	$(CC) -std=gnu99 -Wall -Wextra -g -Itests -Iinclude -o $@ $<
 
-tests/test-coro: tests/test-coro.c tests/common.h coro.c coro.h
+tests/test-coro: tests/test-coro.c tests/common.h user/coro.c include/coro.h
 	$(REQUIRE_LINUX)
-	$(CC) -std=gnu99 -Wall -Wextra -g -I. -o $@ tests/test-coro.c coro.c
+	$(CC) -std=gnu99 -Wall -Wextra -g -Iinclude -o $@ tests/test-coro.c user/coro.c
 
 check-unit: $(UNIT_TESTS)
 	$(REQUIRE_LINUX)
@@ -77,6 +76,9 @@ check: check-unit all
 	@sudo tests/test-integration.sh
 	@echo ""
 	@echo "All tests passed."
+
+cppcheck:
+	@scripts/cppcheck.sh
 
 $(GIT_HOOKS):
 	@scripts/install-git-hooks
@@ -102,4 +104,6 @@ clean:
 ifeq ($(UNAME_S),Linux)
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
 endif
-	$(RM) xo-user $(OBJS) $(UNIT_TESTS)
+	$(RM) xo-user $(USER_OBJS) $(UNIT_TESTS)
+
+endif # KERNELRELEASE
