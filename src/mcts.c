@@ -176,6 +176,8 @@ int mcts(uint32_t table, char player)
         return -1;
     mcts_obj.nr_active_nodes = 1;
     for (int i = 0; i < ITERATIONS; i++) {
+        if (READ_ONCE(kxo_stop_work))
+            break;
         struct node *node = root;
         uint32_t temp_table = table;
         while (1) {

@@ -26,7 +26,7 @@ USER_OBJS := user/xo-user.o user/tui.o user/coro.o
 VANITY_BASE := 0000e59602509f70319e2e4b915fcf1b9a1e2476
 VANITY_PREFIX := 0000
 
-.PHONY: all kmod check-unit check cppcheck clean check-hashes
+.PHONY: all kmod check-unit check cppcheck clean check-hashes check-commitlog
 
 ifneq ($(UNAME_S),Linux)
 define REQUIRE_LINUX
@@ -79,6 +79,9 @@ check: check-unit all
 
 cppcheck:
 	@scripts/cppcheck.sh
+
+check-commitlog:
+	@scripts/check-commitlog.sh
 
 $(GIT_HOOKS):
 	@scripts/install-git-hooks
