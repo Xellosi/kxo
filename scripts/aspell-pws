@@ -159,6 +159,7 @@ xor
 xoro
 xoroshiro
 prng
+MCTS
 ksort
 cmwq
 workqueue

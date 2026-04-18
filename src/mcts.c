@@ -63,8 +63,8 @@ static fixed_point_t fixed_log(fixed_point_t v)
         numerator = (1U << 31) - numerator;
     }
 
-    fixed_point_t y =
-        ((u64) numerator << FIXED_SCALE_BITS) / (v + (1U << FIXED_SCALE_BITS));
+    fixed_point_t y = ((u64) numerator << FIXED_SCALE_BITS) /
+                      ((u64) v + (1U << FIXED_SCALE_BITS));
 
     fixed_point_t ans = 0U;
     for (unsigned i = 1; i < 20; i += 2) {
