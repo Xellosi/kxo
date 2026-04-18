@@ -55,6 +55,7 @@ struct kxo_attr {
 };
 
 static struct kxo_attr attr_obj;
+bool kxo_stop_work;
 static struct ai_game games[N_GAMES];
 static struct ai_avg ai_avgs[N_GAMES];
 static struct xo_avg xo_avgs[N_GAMES];
@@ -89,9 +90,14 @@ static ssize_t kxo_state_store(struct device *dev,
                                const char *buf,
                                size_t count)
 {
+    char d, r, e;
+    if (sscanf(buf, "%c %c %c", &d, &r, &e) != 3)
+        return -EINVAL;
+
     write_lock(&attr_obj.lock);
-    sscanf(buf, "%c %c %c", &(attr_obj.display), &(attr_obj.resume),
-           &(attr_obj.end));
+    attr_obj.display = d;
+    attr_obj.resume = r;
+    WRITE_ONCE(attr_obj.end, e);
     write_unlock(&attr_obj.lock);
     return count;
 }
@@ -182,19 +188,32 @@ static void drawboard_work_func(struct work_struct *w)
     wake_up_interruptible(&rx_wait);
 }
 
+static bool kxo_shutting_down(void)
+{
+    return READ_ONCE(kxo_stop_work) || READ_ONCE(attr_obj.end) != '0';
+}
+
+static void kxo_set_work_stop(bool stop)
+{
+    WRITE_ONCE(kxo_stop_work, stop);
+}
+
 static int play_agent_move(int who, unsigned int table, char player)
 {
     int move;
 
+    if (kxo_shutting_down())
+        return -1;
+
     switch (who) {
     case XO_AI_MCTS:
         mutex_lock(&mcts_lock);
-        move = agents[who].play(table, player);
+        move = kxo_shutting_down() ? -1 : agents[who].play(table, player);
         mutex_unlock(&mcts_lock);
         break;
     case XO_AI_NEGAMAX:
         mutex_lock(&negamax_lock);
-        move = agents[who].play(table, player);
+        move = kxo_shutting_down() ? -1 : agents[who].play(table, player);
         mutex_unlock(&negamax_lock);
         break;
     default:
@@ -215,6 +234,15 @@ static void ai_one_work_func(struct work_struct *w)
     unsigned int table = xo_tlb->table;
     WARN_ON_ONCE(in_softirq());
     WARN_ON_ONCE(in_interrupt());
+
+    /* Bail out quickly when the module is shutting down so that
+     * flush_workqueue() in kxo_exit() does not block for seconds
+     * waiting for a 100k-iteration MCTS computation to finish.
+     */
+    if (kxo_shutting_down()) {
+        WRITE_ONCE(game->state, GAME_READY);
+        return;
+    }
 
     int id = XO_ATTR_ID(attr);
     int steps = XO_ATTR_STEPS(attr);
@@ -243,9 +271,9 @@ static void ai_one_work_func(struct work_struct *w)
         }
         WRITE_ONCE(xo_tlb->attr, XO_SET_ATTR_STEPS(attr, steps + 1));
         pr_debug("[one]move: [%d, %x, %lx]\n", steps, move, xo_tlb->moves);
+        WRITE_ONCE(game->turn, 'X');
     }
 
-    WRITE_ONCE(game->turn, 'X');
     WRITE_ONCE(game->state, GAME_READY);
     smp_wmb();
     mutex_unlock(&game->lock);
@@ -271,6 +299,11 @@ static void ai_two_work_func(struct work_struct *w)
     unsigned int table = xo_tlb->table;
     WARN_ON_ONCE(in_softirq());
     WARN_ON_ONCE(in_interrupt());
+
+    if (kxo_shutting_down()) {
+        WRITE_ONCE(game->state, GAME_READY);
+        return;
+    }
 
     int id = XO_ATTR_ID(attr);
     int steps = XO_ATTR_STEPS(attr);
@@ -299,9 +332,9 @@ static void ai_two_work_func(struct work_struct *w)
         }
         WRITE_ONCE(xo_tlb->attr, XO_SET_ATTR_STEPS(attr, steps + 1));
         pr_debug("[two]move: [%d, %x, %lx]\n", steps, move, xo_tlb->moves);
+        WRITE_ONCE(game->turn, 'O');
     }
 
-    WRITE_ONCE(game->turn, 'O');
     WRITE_ONCE(game->state, GAME_READY);
     smp_wmb();
     mutex_unlock(&game->lock);
@@ -520,11 +553,11 @@ static void timer_handler(struct timer_list *__timer)
     }
     const unsigned int fini = ~unfini & GENMASK(N_GAMES - 1, 0);
 
-    if (unfini) {
+    if (unfini && !kxo_shutting_down()) {
         WRITE_ONCE(game_tasklet.data, unfini);
         ai_game();
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
-    } else if (attr_obj.end == '0' && fini)
+    } else if (!kxo_shutting_down() && fini)
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
 
     tv_end = ktime_get();
@@ -619,8 +652,10 @@ static int kxo_release(struct inode *inode, struct file *filp)
 {
     pr_debug("kxo: %s\n", __func__);
     if (atomic_dec_and_test(&open_cnt)) {
+        kxo_set_work_stop(true);
         del_timer_sync(&timer);
         del_timer_sync(&loadavg_timer);
+        tasklet_kill(&game_tasklet);
         flush_workqueue(kxo_workqueue);
         for (int i = 0; i < N_GAMES; i++) {
             mutex_lock(&games[i].lock);
@@ -629,10 +664,11 @@ static int kxo_release(struct inode *inode, struct file *filp)
             mutex_unlock(&games[i].lock);
         }
         fast_buf_clear();
+        kxo_set_work_stop(false);
     }
     pr_info("release, current cnt: %d\n", atomic_read(&open_cnt));
     write_lock(&attr_obj.lock);
-    attr_obj.end = '0';
+    WRITE_ONCE(attr_obj.end, '0');
     attr_obj.display = '1';
     write_unlock(&attr_obj.lock);
 
@@ -734,6 +770,7 @@ static int __init kxo_init(void)
     attr_obj.display = '1';
     attr_obj.resume = '1';
     attr_obj.end = '0';
+    kxo_stop_work = false;
     rwlock_init(&attr_obj.lock);
     /* Setup the timers */
     timer_setup(&timer, timer_handler, 0);
@@ -762,6 +799,7 @@ static void __exit kxo_exit(void)
 {
     dev_t dev_id = MKDEV(major, 0);
 
+    kxo_set_work_stop(true);
     del_timer_sync(&timer);
     del_timer_sync(&loadavg_timer);
     tasklet_kill(&game_tasklet);

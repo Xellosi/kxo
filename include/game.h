@@ -77,6 +77,14 @@ typedef unsigned fixed_point_t;
 
 extern const line_t lines[4];
 
+#ifdef __KERNEL__
+/* Set by main.c when the module is shutting down.  AI algorithms
+ * should poll this in their hot loops to bail out early so that
+ * flush_workqueue() in kxo_exit() does not block.
+ */
+extern bool kxo_stop_work;
+#endif
+
 int *available_moves(unsigned int table);
 char check_win(unsigned int t);
 fixed_point_t calculate_win_value(char win, unsigned char player);

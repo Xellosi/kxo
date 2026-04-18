@@ -63,8 +63,8 @@ static fixed_point_t fixed_log(fixed_point_t v)
         numerator = (1U << 31) - numerator;
     }
 
-    fixed_point_t y =
-        ((u64) numerator << FIXED_SCALE_BITS) / (v + (1U << FIXED_SCALE_BITS));
+    fixed_point_t y = ((u64) numerator << FIXED_SCALE_BITS) /
+                      ((u64) v + (1U << FIXED_SCALE_BITS));
 
     fixed_point_t ans = 0U;
     for (unsigned i = 1; i < 20; i += 2) {
@@ -176,6 +176,8 @@ int mcts(uint32_t table, char player)
         return -1;
     mcts_obj.nr_active_nodes = 1;
     for (int i = 0; i < ITERATIONS; i++) {
+        if (READ_ONCE(kxo_stop_work))
+            break;
         struct node *node = root;
         uint32_t temp_table = table;
         while (1) {

@@ -30,14 +30,26 @@ fail()
     printf "Test %-40s[ ${RED}FAIL${RESET} ] %s\n" "$1" "$2"
 }
 
+# Signal the module to stop re-arming the game timer and wait for
+# in-flight AI workqueue callbacks to drain, then unload.
+stop_and_unload()
+{
+    if [ -f "$SYSFS" ]; then
+        echo "1 1 1" > "$SYSFS" 2> /dev/null || true
+        sleep 2
+    fi
+    timeout 30 rmmod kxo 2> /dev/null || true
+}
+
 cleanup()
 {
+    set +e
     if [ -n "$READER_PID" ] && kill -0 "$READER_PID" 2> /dev/null; then
-        kill "$READER_PID" 2> /dev/null
-        wait "$READER_PID" 2> /dev/null
+        kill "$READER_PID" 2> /dev/null || true
+        wait "$READER_PID" 2> /dev/null || true
     fi
     if lsmod | grep -q '^kxo '; then
-        rmmod kxo 2> /dev/null
+        stop_and_unload
     fi
 }
 trap cleanup EXIT
@@ -55,7 +67,7 @@ if [ ! -f "$KMOD" ]; then
 fi
 
 if lsmod | grep -q '^kxo '; then
-    rmmod kxo 2> /dev/null
+    stop_and_unload
 fi
 
 dmesg -C
@@ -103,7 +115,7 @@ done
 
 if kill -0 "$READER_PID" 2> /dev/null; then
     pass "device_read_${ELAPSED}s"
-    kill "$READER_PID" 2> /dev/null
+    kill "$READER_PID" 2> /dev/null || true
     wait "$READER_PID" 2> /dev/null || true
     READER_PID=
 else
@@ -129,11 +141,19 @@ else
     dmesg | grep -E '(BUG|scheduling while atomic|leaked atomic|Oops|WARNING.*kxo)' | head -5
 fi
 
+# Signal the module to stop re-arming the game timer before rmmod.
+# The sysfs format is "display resume end"; setting end='1' tells the
+# timer handler to stop dispatching new AI work.
+if [ -f "$SYSFS" ]; then
+    echo "1 1 1" > "$SYSFS"
+    sleep 2
+fi
+
 # Clean unload
-if rmmod kxo 2> /dev/null; then
+if timeout 30 rmmod kxo; then
     pass "rmmod"
 else
-    fail "rmmod" "unload failed"
+    fail "rmmod" "unload failed or timed out"
 fi
 
 # Cleanup verification

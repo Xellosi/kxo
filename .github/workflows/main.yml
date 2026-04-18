@@ -1,0 +1,145 @@
+# Build kxo kernel module and run full test suite.
+#
+# Parallelism (4 independent jobs, 1 sequential):
+#   commit-hygiene -- vanity hash prefix + subject format + AI trailer detection
+#   lint           -- clang-format, newline, banned functions, cppcheck, shfmt
+#   unit-tests     -- test-game, test-coro (no kernel dependency)
+#   build          -- kernel module + xo-user compile check
+#   integration    -- same-runner build, insmod, device I/O, game completion,
+#                     graceful stop via sysfs, clean unload
+#
+# commit-hygiene, lint, unit-tests, and build run in parallel.
+# integration-tests waits for build only.
+name: Build and Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- Commit hygiene: vanity hash prefix + subject format ----
+  commit-hygiene:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (full history for commit validation)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate commit log
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          range=
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            range="${PR_BASE_SHA}..${PR_HEAD_SHA}"
+          elif [ -n "$PUSH_BEFORE_SHA" ] && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            range="${PUSH_BEFORE_SHA}..${PUSH_HEAD_SHA}"
+          fi
+
+          if [ -n "$range" ]; then
+            scripts/check-commitlog.sh --range "$range"
+          else
+            scripts/check-commitlog.sh
+          fi
+
+  # ---- Lint: formatting + static analysis (consolidated, one apt install) ----
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache apt packages
+        uses: actions/cache@v5
+        with:
+          path: ~/apt-cache
+          key: apt-lint-${{ runner.os }}-${{ hashFiles('.github/workflows/main.yml') }}
+
+      - name: Install tools
+        run: |
+          mkdir -p ~/apt-cache
+          sudo apt-get update
+          sudo apt-get install -y -o Dir::Cache::Archives=$HOME/apt-cache \
+            clang-format-20 cppcheck shfmt aspell
+
+      - name: Check trailing newline
+        run: .ci/check-newline.sh
+
+      - name: Check clang-format
+        run: .ci/check-format.sh
+
+      - name: Check banned functions
+        run: .ci/check-banned.sh
+
+      - name: Static analysis (cppcheck)
+        run: .ci/check-cppcheck.sh
+
+      - name: Check shell scripts (shfmt)
+        run: .ci/check-shell.sh
+
+  # ---- Unit tests: no kernel dependency, fast ----
+  unit-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run unit tests
+        run: make check-unit
+
+  # ---- Build kernel module + userspace compile check ----
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-headers-$(uname -r)
+
+      - name: Build kernel module and userspace
+        run: make -j$(nproc)
+
+  # ---- Integration tests: builds and loads module on the same runner ----
+  integration-tests:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-headers-$(uname -r)
+
+      - name: Build kernel module and userspace
+        run: make -j$(nproc)
+
+      - name: Integration tests
+        run: sudo tests/test-integration.sh
+
+      - name: Kernel log diagnosis
+        if: always()
+        run: |
+          echo "=== dmesg (last 100 lines) ==="
+          sudo dmesg | tail -100
+          echo ""
+          echo "=== Module info ==="
+          modinfo kxo.ko 2>/dev/null || echo "(module not found)"
+          echo ""
+          echo "=== Loaded modules (kxo) ==="
+          lsmod | grep kxo || echo "(not loaded)"
