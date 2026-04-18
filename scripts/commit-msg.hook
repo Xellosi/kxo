@@ -130,6 +130,64 @@ read_commit_message()
 }
 
 #
+# Reject commit messages containing AI-generated markers.
+# Instead of silently stripping these trailers, we refuse the commit outright
+# so authors fix the message themselves.
+#
+
+reject_ai_generated_message()
+{
+    # Known AI tool/bot identities -- specific enough to avoid false positives
+    # on human names like "Claude Martin" or employees at openai.com.
+    local ai_id='(Claude Code|Claude Sonnet|Claude Opus|Claude Haiku|Claude AI'
+    ai_id+='|GitHub Copilot|Copilot Chat'
+    ai_id+='|ChatGPT|GPT-[0-9][0-9.]*[[:alnum:].-]*'
+    ai_id+='|Gemini [0-9]|Gemini Pro|Gemini Ultra'
+    ai_id+='|Cursor AI|Cursor Tab'
+    ai_id+='|Windsurf|Codeium|[Cc]odewhisperer'
+    ai_id+='|claude-flow|Devin AI|Devin Bot'
+    ai_id+='|Amazon Q Developer'
+    ai_id+=')'
+
+    # Trailers that must be followed by an AI identity to trigger rejection.
+    # This avoids blanket-rejecting human Co-Authored-By or Made-with lines.
+    local trailer_ai="^[[:space:]]*(Co-Authored-By|Signed-off-by|Suggested-by|Made-with):[[:space:]]*.*${ai_id}"
+
+    # Unconditional AI markers -- no legitimate human use for these.
+    local marker_pattern='^[[:space:]]*(🤖|Generated with \[)'
+
+    # Respect core.commentChar (default '#')
+    local comment_char
+    comment_char=$(git config --get core.commentChar 2> /dev/null || echo '#')
+
+    local violations=""
+    local filtered_message=""
+    local line
+
+    while IFS= read -r line; do
+        [[ $line == "$comment_char"* ]] && continue
+        filtered_message+="${line}"$'\n'
+    done < "$COMMIT_MSG_FILE"
+
+    if grep -Eiq "$trailer_ai" <<< "$filtered_message"; then
+        violations="${violations}  - AI tool listed in commit trailer\n"
+    fi
+
+    if grep -Eiq "$marker_pattern" <<< "$filtered_message"; then
+        violations="${violations}  - AI-generated marker detected\n"
+    fi
+
+    if [ -n "$violations" ]; then
+        echo -e "${RED}Commit rejected: AI-generated commit message detected.${NC}" >&2
+        echo -e "${YELLOW}Violations:${NC}" >&2
+        echo -e "${YELLOW}${violations}${NC}" >&2
+        echo -e "Write your own commit message. Do not let AI tools append trailers." >&2
+        echo -e "See: externals/git-nomad/README.md for context." >&2
+        exit 1
+    fi
+}
+
+#
 # Validate the contents of the commmit msg agains the good commit guidelines.
 #
 
@@ -299,6 +357,9 @@ fi
 while true; do
 
     read_commit_message
+
+    # Hard reject AI-generated messages on every pass so edits cannot add them.
+    reject_ai_generated_message
 
     validate_commit_message
 
