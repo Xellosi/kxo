@@ -1,100 +1,431 @@
 #!/usr/bin/env bash
-
+# shellcheck disable=SC2329
 # Pre-commit hook for kxo.
 #
 # Checks:
-#   1. C/H source files follow .clang-format
-#   2. No banned unsafe functions (gets, sprintf, strcpy)
-#   3. cppcheck static analysis (delegated to scripts/cppcheck.sh)
-#   4. Shell scripts follow shfmt (per .editorconfig, staged content)
+#   1. Reject commits from virtual machines (containers are allowed)
+#   2. C/C++ source files follow .clang-format (staged content only)
+#   3. No banned unsafe functions in newly added lines
+#   4. cppcheck static analysis (delegated to scripts/cppcheck.sh)
+#   5. Shell scripts follow shfmt (per .editorconfig, staged content)
 
+set -u
+
+# CI skip -- only for known CI systems, not a generic CI=1 check, so that
+# the VM gate cannot be bypassed by setting CI in a local environment.
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    exit 0
+fi
+
+# Resolve script directory through symlinks
+resolve_script_dir()
+{
+    local source="${BASH_SOURCE[0]}"
+    while [ -L "$source" ]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd) || return 1
+        source=$(readlink "$source") || return 1
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR=$(resolve_script_dir) || {
+    echo "[!] Failed to resolve hook path." >&2
+    exit 1
+}
+
+# Terminal colors (only when stdout is a TTY)
+if [ -t 1 ]; then
+    RED=$'\033[1;31m'
+    GREEN=$'\033[1;32m'
+    YELLOW=$'\033[1;33m'
+    CYAN=$'\033[1;36m'
+    NC=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' CYAN='' NC=''
+fi
+
+# Progress reporting
 RETURN=0
+ERRORS=()
+WARNINGS=()
+CHECK_NUM=0
 
-CLANG_FORMAT=$(command -v clang-format)
-if [ -z "$CLANG_FORMAT" ]; then
-    echo "[!] clang-format not installed." >&2
+update_progress()
+{
+    ((CHECK_NUM++))
+    printf '\r%s[%d]%s %s...' "$CYAN" "$CHECK_NUM" "$NC" "$1"
+}
+
+report_ok()
+{
+    printf ' [ %sOK%s ]\n' "$GREEN" "$NC"
+}
+
+report_fail()
+{
+    printf ' [ %sFAIL%s ]\n' "$RED" "$NC"
+    [ -n "${1:-}" ] && ERRORS+=("$1")
+    RETURN=1
+}
+
+# Single temp directory, cleaned up on exit
+HOOK_TMPDIR=$(mktemp -d) || exit 1
+cleanup()
+{
+    rm -rf "$HOOK_TMPDIR" 2> /dev/null
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+printf '%sRunning pre-commit checks...%s\n\n' "$CYAN" "$NC"
+
+# CHECK 1: Virtual machine detection
+#
+# Block commits from hypervisor-based VMs.  Containers (Docker, Podman,
+# LXC, systemd-nspawn, etc.) share the host kernel and are allowed.
+# When running inside a container we skip VM checks entirely, because
+# the container may be on a virtualized host (cloud VM, CI runner, etc.)
+# and the hypervisor signals visible from inside the container do not
+# mean the user is committing from a VM -- the container itself is fine.
+
+is_container()
+{
+    # systemd-detect-virt --container is the most reliable.
+    if command -v systemd-detect-virt > /dev/null 2>&1; then
+        local c
+        c=$(systemd-detect-virt --container 2> /dev/null || true)
+        [ -n "$c" ] && [ "$c" != "none" ] && return 0
+    fi
+    [ -f /.dockerenv ] && return 0
+    [ -f /run/.containerenv ] && return 0
+    grep -qaE '/(docker|libpod|podman|kubepods|containerd|lxc|systemd-nspawn)/' \
+        /proc/1/cgroup /proc/self/cgroup 2> /dev/null && return 0
+    return 1
+}
+
+VM_PATTERN='qemu|kvm|bochs|virtualbox|vmware|xen|hyper-v|parallels|bhyve|rhev|ovirt|openstack|amazon ec2|google compute engine|proxmox|lima|utm|apple virtualization|virtual machine|hvm domu'
+
+detect_systemd_vm()
+{
+    command -v systemd-detect-virt > /dev/null 2>&1 || return 1
+    local v
+    v=$(systemd-detect-virt --vm 2> /dev/null || true)
+    [ -n "$v" ] && [ "$v" != "none" ] && {
+        echo "$v"
+        return 0
+    }
+    return 1
+}
+
+detect_lima()
+{
+    if [ -n "${LIMA_VERSION:-}" ] || [ -n "${LIMA_INSTANCE:-}" ] || [ -n "${LIMA_HOME:-}" ]; then
+        echo "lima"
+        return 0
+    fi
+    return 1
+}
+
+detect_dmi_vm()
+{
+    grep -qaEi "$VM_PATTERN" \
+        /sys/class/dmi/id/product_name \
+        /sys/class/dmi/id/product_version \
+        /sys/class/dmi/id/sys_vendor \
+        /sys/class/dmi/id/board_vendor \
+        /sys/class/dmi/id/board_name \
+        /sys/class/dmi/id/bios_vendor \
+        /sys/class/dmi/id/chassis_vendor \
+        2> /dev/null && {
+        echo "dmi-hypervisor"
+        return 0
+    }
+    return 1
+}
+
+detect_devicetree_vm()
+{
+    [ -d /sys/firmware/devicetree/base ] || return 1
+    if grep -qaEi 'qemu|kvm|xen|virtio|linux,dummy-virt|lima|utm|apple,virtualization' \
+        /sys/firmware/devicetree/base/compatible \
+        /sys/firmware/devicetree/base/model 2> /dev/null; then
+        echo "devicetree-hypervisor"
+        return 0
+    fi
+    return 1
+}
+
+detect_cpu_hypervisor()
+{
+    if grep -qaE '(^flags|^Features)[[:space:]]*:.*\bhypervisor\b' /proc/cpuinfo 2> /dev/null; then
+        echo "cpuinfo-hypervisor"
+        return 0
+    fi
+    return 1
+}
+
+update_progress "Virtual machine detection"
+virt=""
+if ! is_container; then
+    for detector in \
+        detect_systemd_vm \
+        detect_lima \
+        detect_dmi_vm \
+        detect_devicetree_vm \
+        detect_cpu_hypervisor; do
+        virt=$("$detector") && break
+    done
+fi
+
+if [ -n "$virt" ]; then
+    report_fail "Running in a virtual machine (detected: $virt)"
+    printf '\n%s[!] Commits from virtual machines are not allowed.%s\n' "$RED" "$NC" >&2
+    printf '    Run this commit on a physical machine instead.\n' >&2
     exit 1
 fi
+report_ok
 
-DIFF=$(command -v colordiff)
-[ -z "$DIFF" ] && DIFF=diff
+# Gather staged files (single git call, reused by all subsequent checks)
 
-# C/H formatting check (staged content)
-FILES=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h)$' || true)
-for FILE in $FILES; do
-    nf=$(git checkout-index --temp "$FILE" | cut -f 1)
-    tempdir=$(mktemp -d) || exit 1
-    newfile=$(mktemp "${tempdir}/$(basename "$nf").XXXXXX") || exit 1
-    basename=$(basename "$FILE")
-    source="${tempdir}/${basename}"
-    mv "$nf" "$source"
-    cp .clang-format "$tempdir"
-    "$CLANG_FORMAT" "$source" > "$newfile" 2> /dev/null
-    "$DIFF" -u -p -B \
-        --label="modified $FILE" \
-        --label="expected coding style" \
-        "$source" "$newfile"
-    r=$?
-    rm -rf "$tempdir"
-    if [ $r != 0 ]; then
-        echo "[!] $FILE does not follow the consistent coding style." >&2
-        echo "    clang-format -i $FILE" >&2
-        echo "" >&2
-        RETURN=1
+C_FILES=()
+ALL_FILES=()
+while IFS= read -r -d '' file; do
+    ALL_FILES+=("$file")
+    case "$file" in
+        *.c | *.cc | *.cpp | *.h | *.hh | *.hpp)
+            C_FILES+=("$file")
+            ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z 2> /dev/null)
+
+if [ ${#ALL_FILES[@]} -eq 0 ]; then
+    printf '%sNo files staged for commit.%s\n' "$YELLOW" "$NC"
+    exit 0
+fi
+
+# Materialize staged content into a temp directory so every check operates
+# on what will actually be committed, not on the working tree.
+STAGED_DIR="$HOOK_TMPDIR/staged"
+mkdir -p "$STAGED_DIR"
+
+if [ ${#C_FILES[@]} -gt 0 ]; then
+    # Extract changed C/C++ files plus all tracked headers so cppcheck
+    # can resolve #include directives from staged content.
+    {
+        printf '%s\0' "${C_FILES[@]}"
+        git ls-files -z -- '*.h' 'include/*.h' 'include/**/*.h' 'src/*.h'
+    } | git checkout-index --stdin -z -f --prefix="$STAGED_DIR/" 2> /dev/null || {
+        echo "[!] Failed to extract staged C/C++ files." >&2
+        exit 1
+    }
+fi
+
+# Extract staged .clang-format (not working-tree copy) so formatting
+# matches what the commit will actually contain.
+if git show :.clang-format > "$STAGED_DIR/.clang-format" 2> /dev/null; then
+    :
+else
+    cp .clang-format "$STAGED_DIR" 2> /dev/null || true
+fi
+
+# CHECK 2: Code formatting (clang-format-20, staged content)
+#
+# Prefer clang-format-20; fall back to unversioned clang-format only if
+# it is version 20.  Any other version is rejected.
+resolve_clang_format()
+{
+    if command -v clang-format-20 > /dev/null 2>&1; then
+        echo "clang-format-20"
+        return
     fi
-done
-
-# Banned unsafe functions (newly added code)
-root=$(git rev-parse --show-toplevel)
-banned='([^f]gets\()|(sprintf\()|(strcpy\()'
-for file in $(git diff --staged --name-only | grep -E '\.(c|cc|cpp|h|hh|hpp)$' || true); do
-    filepath="${root}/${file}"
-    output=$(grep -nrE "${banned}" "${filepath}" || true)
-    if [ -n "${output}" ]; then
-        echo "Dangerous function detected in ${filepath}" >&2
-        echo "${output}" >&2
-        echo "" >&2
-        echo "Read 'Common vulnerabilities guide for C programmers' carefully." >&2
-        echo "    https://security.web.cern.ch/security/recommendations/en/codetools/c.shtml" >&2
-        RETURN=1
+    if command -v clang-format > /dev/null 2>&1; then
+        if clang-format --version 2> /dev/null | grep -q 'version 20'; then
+            echo "clang-format"
+            return
+        fi
     fi
-done
+    echo ""
+}
 
-# cppcheck static analysis (staged C/H files only)
-STAGED_C=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(c|cpp|h)$' || true)
-if [ -n "$STAGED_C" ]; then
-    # shellcheck disable=SC2086
-    if ! scripts/cppcheck.sh $STAGED_C > /dev/null; then
-        echo "[!] Failed to pass static analysis." >&2
-        echo "    scripts/cppcheck.sh $STAGED_C" >&2
-        RETURN=1
+update_progress "C/C++ code style (clang-format)"
+CLANG_FORMAT=$(resolve_clang_format)
+if [ ${#C_FILES[@]} -eq 0 ]; then
+    report_ok
+elif [ -z "$CLANG_FORMAT" ]; then
+    report_fail "clang-format-20 not installed"
+else
+    fmt_errors=0
+    fmt_files=()
+
+    for file in "${C_FILES[@]}"; do
+        staged="$STAGED_DIR/$file"
+        [ -f "$staged" ] || continue
+        formatted="$HOOK_TMPDIR/fmt_${file//\//_}"
+        "$CLANG_FORMAT" "$staged" > "$formatted" 2> /dev/null
+        if ! diff -q "$staged" "$formatted" > /dev/null 2>&1; then
+            fmt_errors=$((fmt_errors + 1))
+            fmt_files+=("$file")
+        fi
+    done
+
+    if [ $fmt_errors -gt 0 ]; then
+        report_fail "$fmt_errors file(s) need formatting"
+        for f in "${fmt_files[@]}"; do
+            WARNINGS+=("  run: $CLANG_FORMAT -i $f")
+        done
+    else
+        report_ok
     fi
 fi
 
-# Shell script formatting (shfmt per .editorconfig, staged blobs)
+# CHECK 3: Banned unsafe functions (newly added lines only)
+
+update_progress "Banned functions"
+# Buffer overflow: gets, sprintf, strcpy, strcat, stpcpy, vsprintf
+banned='(^|[^[:alnum:]_])(gets|sprintf|vsprintf|strcpy|stpcpy|strcat)[[:space:]]*\('
+
+if [ ${#C_FILES[@]} -eq 0 ]; then
+    report_ok
+else
+    # Build diff cache once, reuse for banned function check.
+    DIFF_CACHE="$HOOK_TMPDIR/diff_cache"
+    git diff --cached -U0 -- "${C_FILES[@]}" > "$DIFF_CACHE" 2> /dev/null
+
+    unsafe_found=0
+    unsafe_files=()
+    if [ -s "$DIFF_CACHE" ]; then
+        current_file=""
+        while IFS= read -r line; do
+            if [[ $line == "+++ b/"* ]]; then
+                current_file="${line#'+++ b/'}"
+            elif [[ -n "$current_file" && $line == "+"* && $line != "+++"* ]]; then
+                added="${line:1}"
+                if printf '%s\n' "$added" | grep -qE "$banned"; then
+                    # Deduplicate per file.
+                    local_dup=0
+                    for uf in "${unsafe_files[@]+"${unsafe_files[@]}"}"; do
+                        [ "$uf" = "$current_file" ] && {
+                            local_dup=1
+                            break
+                        }
+                    done
+                    if [ "$local_dup" -eq 0 ]; then
+                        unsafe_found=$((unsafe_found + 1))
+                        unsafe_files+=("$current_file")
+                    fi
+                fi
+            fi
+        done < "$DIFF_CACHE"
+    fi
+
+    if [ $unsafe_found -gt 0 ]; then
+        report_fail "$unsafe_found file(s) add banned functions"
+        for uf in "${unsafe_files[@]}"; do
+            ERRORS+=("  Banned function in $uf")
+        done
+    else
+        report_ok
+    fi
+fi
+
+# CHECK 4: cppcheck static analysis (staged content)
+#
+# Run cppcheck from the staged directory so it analyses what will
+# actually be committed, not the working tree.
+
+update_progress "Static analysis (cppcheck)"
+if [ ${#C_FILES[@]} -eq 0 ]; then
+    report_ok
+elif ! command -v cppcheck > /dev/null 2>&1; then
+    report_fail "cppcheck not installed"
+else
+    cppcheck_log="$HOOK_TMPDIR/cppcheck.log"
+    staged_c_paths=()
+    for f in "${C_FILES[@]}"; do
+        [ -f "$STAGED_DIR/$f" ] && staged_c_paths+=("$f")
+    done
+    if [ ${#staged_c_paths[@]} -gt 0 ]; then
+        # Run from STAGED_DIR so -Iinclude/-Isrc resolve against staged
+        # content and file-specific suppressions match relative paths.
+        if ! (cd "$STAGED_DIR" && "$SCRIPT_DIR/cppcheck.sh" "${staged_c_paths[@]}") > /dev/null 2> "$cppcheck_log"; then
+            report_fail "Static analysis errors found"
+            while IFS= read -r cline; do
+                ERRORS+=("  cppcheck: $cline")
+            done < <(grep -E '(error|warning):' "$cppcheck_log" | head -10)
+        else
+            report_ok
+        fi
+    else
+        report_ok
+    fi
+fi
+
+# CHECK 5: Shell script formatting (shfmt, staged content)
+
+update_progress "Shell script style (shfmt)"
 SHELL_PATHSPECS=('*.sh' '*.hook' 'scripts/install-git-hooks')
 
-HAS_SHELL=0
-while IFS= read -r -d '' _; do
-    HAS_SHELL=1
-    break
+has_shell=0
+shell_files=()
+while IFS= read -r -d '' file; do
+    has_shell=1
+    shell_files+=("$file")
 done < <(git diff --cached --name-only -z --diff-filter=ACMR -- "${SHELL_PATHSPECS[@]}")
 
-if [ "$HAS_SHELL" -eq 1 ]; then
-    SHFMT=$(command -v shfmt)
-    if [ -z "$SHFMT" ]; then
-        echo "[!] shfmt not installed. Unable to check shell script format." >&2
-        exit 1
-    fi
-    while IFS= read -r -d '' file; do
+if [ "$has_shell" -eq 0 ]; then
+    report_ok
+elif ! SHFMT=$(command -v shfmt); then
+    report_fail "shfmt not installed"
+else
+    shfmt_errors=0
+    shfmt_files=()
+    for file in "${shell_files[@]}"; do
         if ! git show ":$file" | "$SHFMT" -d -filename "$file" - > /dev/null 2>&1; then
-            echo "[!] $file does not follow shell script coding style." >&2
-            git show ":$file" | "$SHFMT" -d -filename "$file" - >&2
-            printf '    shfmt -w %q\n' "$file" >&2
-            echo "" >&2
-            RETURN=1
+            shfmt_errors=$((shfmt_errors + 1))
+            shfmt_files+=("$file")
         fi
-    done < <(git diff --cached --name-only -z --diff-filter=ACMR -- "${SHELL_PATHSPECS[@]}")
+    done
+
+    if [ $shfmt_errors -gt 0 ]; then
+        report_fail "$shfmt_errors shell file(s) need formatting"
+        for sf in "${shfmt_files[@]}"; do
+            WARNINGS+=("  run: shfmt -w $sf")
+        done
+    else
+        report_ok
+    fi
+fi
+
+# Summary
+
+printf "\r%*s\r" 60 ""
+
+printf '\n%sFiles to be committed:%s\n' "$CYAN" "$NC"
+for file in "${ALL_FILES[@]}"; do
+    printf "  %s\n" "$file"
+done
+
+if [ ${#ERRORS[@]} -gt 0 ]; then
+    printf '\n%sErrors:%s\n' "$RED" "$NC"
+    for e in "${ERRORS[@]}"; do
+        printf '  [ %sFAIL%s ] %s\n' "$RED" "$NC" "$e"
+    done
+fi
+
+if [ ${#WARNINGS[@]} -gt 0 ]; then
+    printf '\n%sSuggestions:%s\n' "$YELLOW" "$NC"
+    for w in "${WARNINGS[@]}"; do
+        printf '  %s!%s %s\n' "$YELLOW" "$NC" "$w"
+    done
+fi
+
+if [ $RETURN -eq 0 ]; then
+    printf '\n%sAll checks passed!%s\n' "$GREEN" "$NC"
+else
+    printf '\n%sPre-commit checks failed. Please fix the issues above.%s\n' "$RED" "$NC"
 fi
 
 exit $RETURN
