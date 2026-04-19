@@ -364,7 +364,7 @@ while true; do
     validate_commit_message
 
     # if there are no WARNINGS are empty then we're good to break out of here
-    test ${#WARNINGS[@]} -eq 0 && exit 0
+    test ${#WARNINGS[@]} -eq 0 && break
 
     display_warnings
 
@@ -389,3 +389,110 @@ while true; do
     esac
 
 done
+
+#
+# Append a deterministic Change-Id (Gerrit algorithm) when not already present.
+#
+
+if grep -q '^Change-Id: I[0-9a-f]\{40\}' "$COMMIT_MSG_FILE"; then
+    exit 0
+fi
+
+commentChar=$(git config --get core.commentChar 2> /dev/null || echo '#')
+# 'auto' means Git picks dynamically; treat as '#' for our purposes.
+[[ "$commentChar" == "auto" || -z "$commentChar" ]] && commentChar='#'
+
+clean_message=$(awk -v cc="$commentChar" '
+    index($0, cc) == 1 { next }
+    /^diff --git / { exit }
+    /^Signed-off-by:/ { next }
+    { print }
+' "$COMMIT_MSG_FILE" | git stripspace)
+
+# Nothing to sign: skip.
+[ -z "$clean_message" ] && exit 0
+
+_gen_changeid_input()
+{
+    local tree parent author committer
+
+    tree=$(git write-tree) || return 1
+    author=$(git var GIT_AUTHOR_IDENT) || return 1
+    committer=$(git var GIT_COMMITTER_IDENT) || return 1
+
+    echo "tree $tree"
+    if parent=$(git rev-parse "HEAD^0" 2> /dev/null); then
+        echo "parent $parent"
+    fi
+    echo "author $author"
+    echo "committer $committer"
+    echo
+    printf '%s' "$clean_message"
+}
+
+if ! change_id_input=$(_gen_changeid_input); then
+    echo "Failed to build Change-Id input" >&2
+    exit 1
+fi
+
+if ! change_id=$(printf '%s' "$change_id_input" | git hash-object -t commit --stdin); then
+    echo "Failed to compute Change-Id" >&2
+    exit 1
+fi
+
+if [[ ! "$change_id" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Failed to compute valid Change-Id" >&2
+    exit 1
+fi
+
+awk -v id="$change_id" -v cc="$commentChar" '
+BEGIN {
+    isFooter = 0; footerComment = 0; blankLines = 0
+}
+index($0, cc) == 1 { next }
+/^diff --git / { blankLines = 0; while (getline) {}; next }
+/^$/ && (footerComment == 0) { blankLines++; next }
+/^\[[a-zA-Z0-9-]+:/ && (isFooter == 1) { footerComment = 1 }
+/]$/ && (footerComment == 1) { footerComment = 2 }
+(blankLines > 0) {
+    print lines
+    for (i = 0; i < blankLines; i++) print ""
+    lines = ""; blankLines = 0; isFooter = 1; footerComment = 0
+}
+(footerComment == 0) && (!/^\[?[a-zA-Z0-9-]+:/ || /^[a-zA-Z0-9-]+:\/\//) {
+    isFooter = 0
+}
+{
+    if (footerComment == 2) footerComment = 0
+    if (lines != "") lines = lines "\n"
+    lines = lines $0
+}
+END {
+    unprinted = 1
+    if (isFooter == 0) { print lines "\n"; lines = "" }
+    numlines = split(lines, footer, "\n")
+    trailers = ""; other = ""
+    for (i = 1; i <= numlines; i++) {
+        low = tolower(footer[i])
+        if (low ~ /^(signed-off|reviewed|co-authored|acked|suggested|tested|reported)-by:/) {
+            trailers = trailers footer[i] "\n"
+        } else {
+            other = other footer[i] "\n"
+        }
+    }
+    if (other != "") printf "%s", other
+    if (trailers != "") printf "%s", trailers
+    printf "Change-Id: I%s\n", id
+}' "$COMMIT_MSG_FILE" > "${COMMIT_MSG_FILE}.tmp"
+
+if [ $? -ne 0 ] || [ ! -s "${COMMIT_MSG_FILE}.tmp" ]; then
+    rm -f "${COMMIT_MSG_FILE}.tmp"
+    echo "Failed to rewrite commit message with Change-Id" >&2
+    exit 1
+fi
+
+if ! mv "${COMMIT_MSG_FILE}.tmp" "$COMMIT_MSG_FILE"; then
+    rm -f "${COMMIT_MSG_FILE}.tmp"
+    echo "Failed to write Change-Id to commit message" >&2
+    exit 1
+fi
